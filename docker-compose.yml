@@ -1,0 +1,80 @@
+#  docker compose up
+
+services:
+  rabbitmq:
+    image: rabbitmq:4.2-rc
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "15672:15672"  # management UI
+      - "5672:5672"
+    networks:
+      - internal
+
+  redis:
+    image: redis:8.2.2
+    ports:
+      - "6379:6379"
+    networks:
+      - internal
+
+  postgres:
+    image: postgres:18.0
+    environment:
+      POSTGRES_USER: pguser
+      POSTGRES_PASSWORD: pgpass
+      POSTGRES_DB: managerdb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - internal
+
+  # llm-service:
+  #   build:
+  #     context: ./llm-service
+  #     dockerfile: Dockerfile
+  #   environment:
+  #     - PORT=8000
+  #   ports:
+  #     - "8000:8000"   # только для локальной разработки; в prod можно убрать
+  #   depends_on:
+  #     - redis
+  #   networks:
+  #     - internal
+
+  # manager:
+  #   build:
+  #     context: ./manager
+  #     dockerfile: Dockerfile
+  #   environment:
+  #     - RABBIT_URL=amqp://guest:guest@rabbitmq:5672/
+  #     - LLM_URL=http://llm-service:8000/api/v1/infer
+  #   depends_on:
+  #     - rabbitmq
+  #     - llm-service
+  #     - postgres
+  #     - redis
+  #   networks:
+  #     - frontend
+  #     - internal
+
+  # worker:
+  #   build:
+  #     context: ./worker
+  #     dockerfile: Dockerfile
+  #   environment:
+  #     - RABBIT_URL=amqp://guest:guest@rabbitmq:5672/
+  #     - LLM_URL=http://llm-service:8000/api/v1/infer
+  #   depends_on:
+  #     - rabbitmq
+  #     - llm-service
+  #   networks:
+  #     - internal
+
+networks:
+  frontend:
+  internal:
+
+volumes:
+  pgdata:
