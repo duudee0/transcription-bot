@@ -7,19 +7,42 @@ import sys
 import json
 import asyncio
 
-# Импортируем ТОЛЬКО наши существующие модели
+# Импортируем модели запросов
 from common.models import TaskMessage, ResultMessage, ResultData, MessageType
 
-app = FastAPI(title="LLM Service", version="0.2")
+# Для синхроной работы
+is_processing = False
+current_task_id = None
+processing_start_time = None
 
-# НИКАКИХ НОВЫХ МОДЕЛЕЙ! Используем только то что уже есть в common.models
+app = FastAPI(title="LLM Service", version="0.2")
 
 # "База данных" в памяти для демонстрации (просто словарь)
 processing_history = {}
 
+# Жив ли контейнер
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "llm-service"}
+
+# Занят ли процессом и каким 
+@app.get("/status")
+async def status():
+    global is_processing, current_task_id, processing_start_time
+    
+    status_info = {
+        "is_busy": is_processing,
+        "timestamp": time.time()
+    }
+    
+    if is_processing:
+        status_info.update({
+            "current_task_id": str(current_task_id),
+            "processing_since": processing_start_time,
+            "processing_time_seconds": time.time() - processing_start_time if processing_start_time else 0
+        })
+    
+    return status_info
 
 @app.get("/requests")
 async def list_requests():
@@ -108,33 +131,58 @@ async def process_task(task_message: TaskMessage) -> ResultData:
     Обработка задачи используя существующие модели.
     Возвращаем ResultData - часть нашей существующей модели ResultMessage.
     """
-    await asyncio.sleep(0.1)  # Имитация обработки
+
+    global is_processing, current_task_id, processing_start_time
     
-    task_type = task_message.data.task_type
-    input_data = task_message.data.input_data
+    if is_processing:
+        raise HTTPException(
+            status_code=423,  # Locked
+            detail=f"Service is busy processing task {current_task_id}"
+        )
     
-    if task_type == "analyze_text":
-        result = await analyze_text(input_data)
-    elif task_type == "process_image":
-        result = await process_image(input_data)
-    elif task_type == "generate_response":
-        result = await generate_response(input_data)
-    else:
-        result = {
-            "status": "unknown_task_type",
-            "received_data": input_data,
-            "note": "This task type is not implemented yet"
-        }
+    # ДОБАВЬ ЭТО ПЕРЕД ОБРАБОТКОЙ
+    is_processing = True
+    current_task_id = task_message.message_id
+    processing_start_time = time.time()
+
+    try:
+        await asyncio.sleep(10)  # Имитация обработки
+        
+        task_type = task_message.data.task_type
+        input_data = task_message.data.input_data
+        
+        if task_type == "analyze_text":
+            result = await analyze_text(input_data)
+        elif task_type == "generate_response":
+            result = await generate_response(input_data)
+        else:
+            result = {
+                "status": "unknown_task_type",
+                "received_data": input_data,
+                "note": "This task type is not implemented yet"
+            }
+        
+        return ResultData(
+            success=True,
+            result=result,
+            execution_metadata={
+                "processing_time_ms": 150.0,
+                "task_type": task_type,
+                "service": "llm-service"
+            }
+        )
     
-    return ResultData(
-        success=True,
-        result=result,
-        execution_metadata={
-            "processing_time_ms": 150.0,
-            "task_type": task_type,
-            "service": "llm-service"
-        }
-    )
+    except Exception as e:
+        return ResultData(
+            success=False,
+            error_message = str(e),
+        )  
+    
+    finally:
+        # (даже при ошибках)
+        is_processing = False
+        current_task_id = None
+        processing_start_time = None
 
 async def analyze_text(input_data: Dict[str, Any]) -> Dict[str, Any]:
     """Анализ текста используя существующие форматы"""
@@ -152,18 +200,6 @@ async def analyze_text(input_data: Dict[str, Any]) -> Dict[str, Any]:
         "sample_analysis": {
             "sentiment": "positive" if any(word in text.lower() for word in ["хорош", "отлич", "прекрас"]) else "neutral"
         }
-    }
-
-async def process_image(input_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Обработка изображения используя существующие форматы"""
-    image_url = input_data.get("image_url", "")
-    
-    return {
-        "task": "image_processing", 
-        "original_url": image_url,
-        #"processed_url": f"https://storage.example.com/processed/{task_message.message_id}",
-        "dimensions": {"width": 800, "height": 600},
-        "format": "jpeg"
     }
 
 async def generate_response(input_data: Dict[str, Any]) -> Dict[str, Any]:

@@ -25,8 +25,58 @@ TARGET_URL = os.getenv("TARGET_URL", "http://llm-service:8000/api/v1/infer")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10.0"))
 WORKER_NAME = os.getenv("WORKER_NAME", "generic-worker")
 
+# Конфигурация сервисов (добавляем новые сервисы сюда)
+SERVICE_CONFIGS = {
+    "analyze_text": {
+        "base_url": "http://llm-service:8000",
+        "service_name": "llm-service"
+    },
+    # "process_image": {
+    #     "base_url": "http://image-service:8000", 
+    #     "service_name": "image-service"
+    # },
+}
+
 print(f"🚀 Typed worker '{WORKER_NAME}' starting...", file=sys.stderr)
 print(f"Config: RABBIT_URL={RABBIT_URL}, QUEUE={QUEUE_NAME}, SEND_METHOD={SEND_METHOD}", file=sys.stderr)
+
+
+async def check_service_ready(service_config: dict) -> bool:
+    """Проверяет что сервис готов к работе (health + status)"""
+    base_url = service_config["base_url"]
+    
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            # Проверяем здоровье
+            health_response = await client.get(f"{base_url}/health")
+            if health_response.status_code != 200:
+                return False
+            
+            # Проверяем занятость
+            status_response = await client.get(f"{base_url}/status")
+            if status_response.status_code == 200:
+                status_data = status_response.json()
+                return not status_data.get("is_busy", False)
+            
+            return False
+    except Exception:
+        return False
+
+
+def get_service_config(task_type: str, target_service: str = None) -> dict:
+    """Определяет какой сервис должен обрабатывать задачу"""
+    # Если явно указан целевой сервис
+    if target_service:
+        for config in SERVICE_CONFIGS.values():
+            if config["service_name"] == target_service:
+                return config
+    
+    # Определяем по типу задачи
+    if task_type in SERVICE_CONFIGS:
+        return SERVICE_CONFIGS[task_type]
+    
+    # Fallback - используем первый доступный сервис
+    return next(iter(SERVICE_CONFIGS.values()))
 
 
 async def send_via_http(payload) -> dict:
@@ -56,6 +106,7 @@ async def send_via_http(payload) -> dict:
         except Exception as e:
             print(f"❌ HTTP send failed: {e}", file=sys.stderr)
             return {"error": str(e)}
+
 
 async def publish_to_queue(channel, message: ResultMessage, queue_name: str):
     """Опубликовать типизированное сообщение в очередь"""
@@ -97,30 +148,9 @@ async def process_task(task: TaskMessage) -> ResultMessage:
         )
 
 
-# async def process_image_task(task: TaskMessage) -> dict:
-#     """Пример обработки изображения"""
-#     # Здесь твоя реальная логика обработки изображений
-#     return {
-#         "processed_url": f"https://storage.example.com/processed/{task.message_id}",
-#         "dimensions": {"width": 800, "height": 600},
-#         "format": "jpeg"
-#     }
-
-
-async def analyze_text_task(task: TaskMessage) -> dict:
-    """Пример анализа текста"""
-    # Здесь твоя реальная логика анализа текста
-    text = task.data.input_data.get("text", "")
-    return {
-        "word_count": len(text.split()),
-        "sentiment": "positive",  # упрощенный анализ
-        "language": "ru"
-    }
-
-
 async def handle_message(msg: IncomingMessage):
-    """Упрощенная обработка - только логируем результат"""
-    async with msg.process(requeue=False):
+    """Обработка с проверкой состояния сервисов"""
+    async with msg.process(requeue=True):  # Изменяем на requeue=True для возврата в очередь
         try:
             body = msg.body.decode("utf-8")
             task_message = TaskMessage.model_validate_json(body)
@@ -128,6 +158,21 @@ async def handle_message(msg: IncomingMessage):
             print(f"📨 Received typed message: {task_message.message_id}")
             print(f"   Task: {task_message.data.task_type}")
             print(f"   From: {task_message.source_service}")
+            
+            # Определяем целевой сервис
+            service_config = get_service_config(
+                task_message.data.task_type,
+                task_message.target_service
+            )
+            
+            service_name = service_config["service_name"]
+            print(f"🎯 Target service: {service_name}")
+            
+            # ПРОВЕРЯЕМ ГОТОВНОСТЬ СЕРВИСА
+            if not await check_service_ready(service_config):
+                print(f"⏸️ Service {service_name} not ready, requeuing...")
+                await asyncio.sleep(5)  # Ждем перед повторной попыткой
+                return  # Сообщение вернется в очередь благодаря requeue=True
             
             # Обрабатываем задачу
             result_message = await process_task(task_message)
@@ -141,6 +186,7 @@ async def handle_message(msg: IncomingMessage):
                 
         except Exception as e:
             print(f"❌ Message processing failed: {e}")
+            await asyncio.sleep(1)  # Короткая пауза перед повторной попыткой
 
 
 async def main():

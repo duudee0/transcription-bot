@@ -75,7 +75,7 @@ services:
       dockerfile: worker/Dockerfile
     environment:
       - RABBIT_URL=amqp://guest:guest@rabbitmq:5672/
-      #- LLM_URL=http://llm-service:8000/api/v1/infer
+      - LLM_URL=http://llm-service:8000/api/v1/infer
     depends_on:
       - rabbitmq
       #- llm-service
