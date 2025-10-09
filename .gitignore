@@ -6,6 +6,7 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
 ENV/
 env.bak/
 venv.bak/
@@ -16,3 +17,4 @@ venv.bak/
 # Temporary files
 *.tmp
 *.temp
+rabbitmq/

@@ -2,10 +2,14 @@
 
 services:
   rabbitmq:
-    image: rabbitmq:4.2-rc
+    image: rabbitmq:management
+    restart: always
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
+      #- RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS=-rabbit disk_free_limit 2147483648
+    volumes:
+      - ./rabbitmq:/var/lib/rabbitmq
     ports:
       - "15672:15672"  # management UI
       - "5672:5672"
@@ -30,18 +34,24 @@ services:
     networks:
       - internal
 
-  # llm-service:
-  #   build:
-  #     context: ./llm-service
-  #     dockerfile: Dockerfile
-  #   environment:
-  #     - PORT=8000
-  #   ports:
-  #     - "8000:8000"   # только для локальной разработки; в prod можно убрать
-  #   depends_on:
-  #     - redis
-  #   networks:
-  #     - internal
+  llm-service:
+    build:
+      context: ./models/testing
+      dockerfile: Dockerfile
+    environment:
+      - PORT=8000
+    ports:
+      - "8000:8000"   # только для локальной разработки; в prod можно убрать
+    depends_on:
+      - redis
+    # Это проверка "здоровья" контейнера
+    # healthcheck:
+    #   test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+    #   interval: 5s
+    #   timeout: 3s
+    #   retries: 5
+    networks:
+      - internal
 
   # manager:
   #   build:
@@ -59,18 +69,20 @@ services:
   #     - frontend
   #     - internal
 
-  # worker:
-  #   build:
-  #     context: ./worker
-  #     dockerfile: Dockerfile
-  #   environment:
-  #     - RABBIT_URL=amqp://guest:guest@rabbitmq:5672/
-  #     - LLM_URL=http://llm-service:8000/api/v1/infer
-  #   depends_on:
-  #     - rabbitmq
-  #     - llm-service
-  #   networks:
-  #     - internal
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    environment:
+      - RABBIT_URL=amqp://guest:guest@rabbitmq:5672/
+      #- LLM_URL=http://llm-service:8000/api/v1/infer
+    depends_on:
+      - rabbitmq
+      #- llm-service
+    command: sh -c "sleep 7 && exec python main.py"
+
+    networks:
+      - internal
 
 networks:
   frontend:
