@@ -16,34 +16,34 @@ services:
     networks:
       - internal
 
-  redis:
-    image: redis:8.2.2
-    ports:
-      - "6379:6379"
-    networks:
-      - internal
+  # redis:
+  #   image: redis:8.2.2
+  #   ports:
+  #     - "6379:6379"
+  #   networks:
+  #     - internal
 
-  postgres:
-    image: postgres:18.0
-    environment:
-      POSTGRES_USER: pguser
-      POSTGRES_PASSWORD: pgpass
-      POSTGRES_DB: managerdb
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    networks:
-      - internal
+  # postgres:
+  #   image: postgres:18.0
+  #   environment:
+  #     POSTGRES_USER: pguser
+  #     POSTGRES_PASSWORD: pgpass
+  #     POSTGRES_DB: managerdb
+  #   volumes:
+  #     - pgdata:/var/lib/postgresql/data
+  #   networks:
+  #     - internal
 
   llm-service:
     build:
-      context: ./models/testing
-      dockerfile: Dockerfile
+      context: ./
+      dockerfile: models/testing/Dockerfile
     environment:
       - PORT=8000
     ports:
       - "8000:8000"   # только для локальной разработки; в prod можно убрать
-    depends_on:
-      - redis
+    # depends_on:
+    #   - redis
     # Это проверка "здоровья" контейнера
     # healthcheck:
     #   test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
@@ -71,8 +71,8 @@ services:
 
   worker:
     build:
-      context: ./worker
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: worker/Dockerfile
     environment:
       - RABBIT_URL=amqp://guest:guest@rabbitmq:5672/
       #- LLM_URL=http://llm-service:8000/api/v1/infer
