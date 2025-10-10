@@ -151,4 +151,46 @@ json_string = task.model_dump_json()
 
 4. ДЕСЕРИАЛИЗАЦИЯ ИЗ JSON:
 restored_task = TaskMessage.model_validate_json(json_string)
+
+5. ПРИМЕР ТОГО ЧТО МОЖНО ОТПРАВИТЬ В РАББИТ И ВОРКЕР ЭТО НОРМАЛЬНО ОБРАБОТАЕТ
+{
+  "message_id": "123e4567-e89b-12d3-a456-426614174001",
+  "message_type": "task", 
+  "source_service": "test-client",
+  "timestamp": "2024-01-15T10:35:00.000Z",
+  "version": "1.0",
+  "data": {
+    "task_type": "analyze_text",
+    "input_data": {
+      "text": "Тест автоопределения сервиса по типу задачи"
+    },
+    "parameters": {
+      "simple_mode": true
+    }
+  }
+}
+
+ИЛИ
+
+{
+  "message_id": "123e4567-e89b-12d3-a456-426614174002",
+  "message_type": "task",
+  "source_service": "test-client", 
+  "target_service": "image-service",
+  "timestamp": "2024-01-15T10:40:00.000Z",
+  "version": "1.0",
+  "data": {
+    "task_type": "process_image",
+    "input_data": {
+      "image_url": "https://example.com/test.jpg",
+      "format": "jpeg"
+    },
+    "parameters": {
+      "width": 800,
+      "height": 600,
+      "quality": 85
+    }
+  }
+}
+
 """

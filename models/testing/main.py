@@ -59,7 +59,7 @@ async def get_request(request_id: str):
         return processing_history[request_id]
     raise HTTPException(status_code=404, detail="Request not found")
 
-@app.post("/api/v1/infer")
+@app.post("/api/v1/process")
 async def infer(request: Request) -> ResultMessage:
     """
     Endpoint для обработки задач.
