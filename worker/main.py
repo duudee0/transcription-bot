@@ -13,6 +13,7 @@ import sys
 import time
 from typing import Optional, Dict, Any
 from aio_pika import connect_robust, Message, IncomingMessage
+from uuid import uuid4
 import httpx
 
 # Импортируем наши модели
@@ -23,7 +24,7 @@ RABBIT_URL = os.getenv("RABBIT_URL", "amqp://guest:guest@rabbitmq:5672/")
 QUEUE_NAME = os.getenv("QUEUE_NAME", "tasks")
 RESULT_QUEUE = os.getenv("RESULT_QUEUE", "results")
 SEND_METHOD = os.getenv("SEND_METHOD", "http")
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10.0"))
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "36.0"))
 WORKER_NAME = os.getenv("WORKER_NAME", "generic-worker")
 
 # Конфигурация сервисов (добавляем новые сервисы сюда)
@@ -309,8 +310,8 @@ async def handle_message(msg: IncomingMessage):
         result_message = await process_task(task_message)
         
         # ПРОСТО ЛОГИРУЕМ РЕЗУЛЬТАТ вместо отправки
-        logger.info(f"✅ Task completed: {result_message.data.success}")
-        logger.info(f"✅ Result: {result_message.data.result}")
+        #logger.info(f"✅ Task completed: {result_message.data.success}")
+
         
         # Подтверждаем вручную после УСПЕШНОЙ обработки
         await msg.ack()
