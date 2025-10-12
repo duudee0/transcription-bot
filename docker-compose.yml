@@ -34,6 +34,21 @@ services:
   #   networks:
   #     - internal
 
+  gigachat-service:
+    build:
+      context: ./
+      dockerfile: models/gigachat/Dockerfile
+    environment:
+      - PORT=8000
+      - GIGACHAT_TOKEN=${GIGACHAT_TOKEN}
+      - GIGACHAT_MODEL=GigaChat
+      - GIGACHAT_VERIFY_SSL=False
+    ports:
+      - "8001:8000"   # Different port to avoid conflict
+    networks:
+      - internal
+
+
   llm-service:
     build:
       context: ./

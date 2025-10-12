@@ -29,6 +29,10 @@ WORKER_PORT = int(os.getenv("WORKER_PORT", "8080"))
 
 # Конфигурация сервисов
 SERVICE_CONFIGS = {
+    "generate_response": {
+        "base_url": "http://gigachat-service:8000",
+        "service_name": "gigachat-service"
+    },
     "analyze_text": {
         "base_url": "http://llm-service:8000",
         "service_name": "llm-service"
