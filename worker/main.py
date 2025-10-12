@@ -496,13 +496,8 @@ async def process_task(task: TaskMessage) -> Optional[ResultMessage]:
             }
         )
         
-        logger.info(f"🔔 Using webhook for task {task.message_id}")
-        task_manager.register_async_task(task, service_config)
-        
-        # Отправляем задачу с вебхуком
         service_result = await send_via_http(target_url, enhanced_task.model_dump())
 
-        
         # ОБРАБОТКА РЕЗУЛЬТАТА
         if "error" in service_result:
             logger.error(f"❌ HTTP request failed to {service_name}: {service_result['error']}")
@@ -517,6 +512,10 @@ async def process_task(task: TaskMessage) -> Optional[ResultMessage]:
                 )
             )
         
+        # Отправляем задачу с вебхуком
+        logger.info(f"🔔 Using webhook for task {task.message_id}")
+        task_manager.register_async_task(task, service_config)   
+
         # Если задача была отправлена асинхронно, возвращаем None - результат придет через вебхук
         logger.info(f"⏳ Task {task.message_id} processing asynchronously")
         return None
