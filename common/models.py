@@ -193,4 +193,20 @@ restored_task = TaskMessage.model_validate_json(json_string)
   }
 }
 
+Gigachat:
+
+{
+  "message_id": "123e4567-e89b-12d3-a456-426614174002",
+  "message_type": "task",
+  "source_service": "test-client", 
+  "timestamp": "2024-01-15T10:40:00.000Z",
+  "version": "1.0",
+    "data": {
+      "task_type": "generate_response",
+      "input_data": {
+        "prompt": "привет."
+      }
+    }
+}
+
 """

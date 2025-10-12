@@ -77,7 +77,7 @@ class AsyncTaskManager:
     def __init__(self):
         self.active_tasks: Dict[str, AsyncTaskState] = {}
         self.max_wait_time = 3600  # 1 час максимум
-        self.check_interval = 30   # проверка каждые 30 секунд
+        self.check_interval = 5   # проверка каждые 30 секунд
         self.max_attempts = 3
         
     async def start_monitoring(self):
@@ -126,6 +126,8 @@ class AsyncTaskManager:
                 # Если вебхук не пришел, проверяем статус задачи
                 if not task_state.callback_received:
                     await self._check_task_status(task_id, task_state)
+                else: # Вебхук пришел удаляем
+                    completed_tasks.append(task_id)
                     
             except Exception as e:
                 logger.error(f"❌ Error monitoring task {task_id}: {e}")
@@ -143,6 +145,7 @@ class AsyncTaskManager:
         """Проверяет жив ли сервис"""
         try:
             health_url = f"{service_config['base_url']}/health"
+            logger.info(f"❔ Check health: url - {health_url}")
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.get(health_url)
                 return response.status_code == 200
@@ -154,6 +157,7 @@ class AsyncTaskManager:
         try:
             # Используем endpoint статуса сервиса
             status_url = f"{task_state.service_config['base_url']}/status"
+            logger.info(f"❓ Check status task: url - {status_url}")
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.get(status_url)
                 
@@ -203,6 +207,9 @@ class AsyncTaskManager:
                     }
                 )
             )
+            # Удаляем из активных задач
+            self.active_tasks.pop(task_id)
+
             await send_to_result_queue(result_message)
     
     async def _handle_task_failed(self, task_id: str, error: str):
@@ -290,11 +297,11 @@ class AsyncTaskManager:
         task_state.callback_received = True
         task_state.last_check = time.time()
         
-        if payload.get("status") == "completed":
+        if payload.get("success") != True:
             logger.info(f"✅ Webhook: task {message_id} completed")
             await self._handle_task_completed(message_id, payload.get("result", {}))
             return True
-        elif payload.get("status") == "failed":
+        else:
             logger.error(f"❌ Webhook: task {message_id} failed")
             await self._handle_task_failed(message_id, payload.get("error_message", "Unknown error"))
             return True
@@ -304,13 +311,10 @@ class AsyncTaskManager:
 # Глобальный менеджер задач
 task_manager = AsyncTaskManager()
 
-# =============================================================================
-# СУЩЕСТВУЮЩИЙ КОД (с минимальными изменениями)
-# =============================================================================
 
 async def check_service_ready(service_config: dict) -> bool:
     """Проверяет что сервис готов к работе (health + status) с детальным логированием"""
-    # СУЩЕСТВУЮЩИЙ КОД БЕЗ ИЗМЕНЕНИЙ
+
     base_url = service_config["base_url"]
     service_name = service_config["service_name"]
     
@@ -350,7 +354,7 @@ async def check_service_ready(service_config: dict) -> bool:
 
 def get_service_config(task_type: str, target_service: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Определяет какой сервис должен обрабатывать задачу с детальным логированием"""
-    # СУЩЕСТВУЮЩИЙ КОД БЕЗ ИЗМЕНЕНИЙ
+
     logger.info(f"🔍 Looking up service config for task_type='{task_type}', target_service='{target_service}'")
     
     # Если явно указан целевой сервис
@@ -382,7 +386,7 @@ def get_service_config(task_type: str, target_service: Optional[str] = None) -> 
 
 async def send_via_http(url: str, payload: dict) -> dict:
     """Универсальная функция отправки HTTP запроса с улучшенным логированием"""
-    # СУЩЕСТВУЮЩИЙ КОД БЕЗ ИЗМЕНЕНИЙ
+
     logger.info(f"🌐 HTTP Request: POST {url}")
     
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
@@ -428,6 +432,7 @@ async def send_via_http(url: str, payload: dict) -> dict:
             logger.error(f"💥 {error_msg}")
             return {"error": error_msg}
 
+# TODO: ОПРЕДЕЛИТЬСЯ КАК МЫ БУДЕМ РАСПРЕДЕЛЯТЬ ГОТОВЫЕ ОТВЕТЫ
 async def send_to_result_queue(result_message: ResultMessage):
     """Отправляет результат в очередь результатов"""
     # Эта функция будет реализована позже
@@ -470,43 +475,33 @@ async def process_task(task: TaskMessage) -> Optional[ResultMessage]:
         
         logger.info(f"🎯 Target: {service_name} at {target_url}")
         
-        # =====================================================================
-        # НОВАЯ ЛОГИКА: Пытаемся использовать вебхук для долгих задач
-        # =====================================================================
+        # Пытаемся использовать вебхук для долгих задач
+        # Добавляем callback_url для вебхука
+        callback_url = f"http://{WORKER_HOST}:{WORKER_PORT}/webhook/{task.message_id}"
         
-        # Проверяем, поддерживает ли задача асинхронную обработку
-        # (например, по типу задачи или настройкам)
-        should_use_async = task.data.task_type in ["analyze_text", "process_image"]
+        # Создаем копию задачи с callback_url
+        enhanced_input_data = {
+            **task.data.input_data,
+            "callback_url": callback_url,
+            "webhook_supported": True
+        }
         
-        if should_use_async:
-            # Добавляем callback_url для вебхука
-            callback_url = f"http://{WORKER_HOST}:{WORKER_PORT}/webhook/{task.message_id}"
-            
-            # Создаем копию задачи с callback_url
-            enhanced_input_data = {
-                **task.data.input_data,
-                "callback_url": callback_url,
-                "webhook_supported": True
-            }
-            
-            enhanced_task = TaskMessage(
-                **{
-                    **task.model_dump(),
-                    "data": {
-                        **task.data.model_dump(),
-                        "input_data": enhanced_input_data
-                    }
+        enhanced_task = TaskMessage(
+            **{
+                **task.model_dump(),
+                "data": {
+                    **task.data.model_dump(),
+                    "input_data": enhanced_input_data
                 }
-            )
-            
-            logger.info(f"🔔 Using webhook for task {task.message_id}")
-            task_manager.register_async_task(task, service_config)
-            
-            # Отправляем задачу с вебхуком
-            service_result = await send_via_http(target_url, enhanced_task.model_dump())
-        else:
-            # Стандартная синхронная обработка
-            service_result = await send_via_http(target_url, task.model_dump())
+            }
+        )
+        
+        logger.info(f"🔔 Using webhook for task {task.message_id}")
+        task_manager.register_async_task(task, service_config)
+        
+        # Отправляем задачу с вебхуком
+        service_result = await send_via_http(target_url, enhanced_task.model_dump())
+
         
         # ОБРАБОТКА РЕЗУЛЬТАТА
         if "error" in service_result:
@@ -523,48 +518,9 @@ async def process_task(task: TaskMessage) -> Optional[ResultMessage]:
             )
         
         # Если задача была отправлена асинхронно, возвращаем None - результат придет через вебхук
-        if should_use_async:
-            logger.info(f"⏳ Task {task.message_id} processing asynchronously")
-            return None
-        
-        logger.info(f"✅ Successfully received response from {service_name}")
-        
-        # Пытаемся создать ResultMessage из ответа
-        try:
-            if isinstance(service_result, dict) and "message_type" in service_result:
-                result_msg = ResultMessage.model_validate(service_result)
-                result_msg.source_service = WORKER_NAME
-                result_msg.target_service = task.source_service
-                return result_msg
-            else:
-                # Обертываем сырой ответ
-                return ResultMessage(
-                    source_service=WORKER_NAME,
-                    target_service=task.source_service,
-                    original_message_id=task.message_id,
-                    data=ResultData(
-                        success=True,
-                        result=service_result,
-                        execution_metadata={
-                            "worker": WORKER_NAME,
-                            "service": service_name,
-                            "processed_via": "http"
-                        }
-                    )
-                )
-                
-        except Exception as validation_error:
-            logger.error(f"❌ Response validation failed: {validation_error}")
-            return ResultMessage(
-                source_service=WORKER_NAME,
-                target_service=task.source_service,
-                original_message_id=task.message_id,
-                data=ResultData(
-                    success=False,
-                    error_message=f"Invalid response format: {validation_error}",
-                    execution_metadata={"worker": WORKER_NAME, "service": service_name}
-                )
-            )
+        logger.info(f"⏳ Task {task.message_id} processing asynchronously")
+        return None
+
         
     except Exception as e:
         logger.error(f"💥 Unexpected error in process_task: {e}", exc_info=True)
@@ -627,10 +583,8 @@ async def handle_message(msg: IncomingMessage):
         await asyncio.sleep(1)
         await msg.nack(requeue=False)
 
-# =============================================================================
-# FastAPI для вебхуков (запускается в отдельном потоке)
-# =============================================================================
 
+# FastAPI для вебхуков 
 from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 
@@ -641,7 +595,7 @@ async def webhook_handler(message_id: str, request: Request):
     """Обрабатывает вебхук уведомления от сервисов"""
     try:
         payload = await request.json()
-        logger.info(f"📬 Webhook received for {message_id}: {payload.get('status', 'unknown')}")
+        logger.info(f"📬 Webhook received for {message_id}: {payload.get('success', 'unknown')}")
         
         # Передаем в менеджер задач
         processed = await task_manager.handle_webhook(message_id, payload)
@@ -649,6 +603,7 @@ async def webhook_handler(message_id: str, request: Request):
         if processed:
             return {"status": "processed"}
         else:
+            logger.error(f"☢️ Webhook ignoring request: {str(payload)}")
             return {"status": "ignored"}
             
     except Exception as e:
@@ -667,9 +622,23 @@ async def list_tasks():
         "tasks": list(task_manager.active_tasks.keys())
     }
 
-def run_webhook_server():
-    """Запускает вебхук сервер в отдельном процессе"""
-    uvicorn.run(webhook_app, host="0.0.0.0", port=WORKER_PORT, log_level="info")
+async def run_webhook_server_async():
+    """
+    Запускает Uvicorn ASGI сервер асинхронно в текущем event loop.
+    Важно: Server.serve() — корутина, поэтому её можно запустить через create_task.
+    """
+    config = uvicorn.Config(
+        app=webhook_app,
+        host="0.0.0.0",
+        port=WORKER_PORT,
+        log_level="info",
+        # lifespan="on"  # можно включить если нужен lifespan events
+    )
+    server = uvicorn.Server(config)
+    # server.serve() блокирует до завершения сервера — это корутина, которую мы запустим как таск
+    await server.serve()
+
+
 
 # =============================================================================
 # Основная функция
@@ -678,11 +647,9 @@ def run_webhook_server():
 async def main():
     """Основная функция инициализации"""
     try:
-        # Запускаем вебхук сервер в фоне
-        import threading
-        webhook_thread = threading.Thread(target=run_webhook_server, daemon=True)
-        webhook_thread.start()
-        logger.info(f"🌐 Webhook server started on port {WORKER_PORT}")
+        # Запускаем вебхук сервер в том же event loop как background task
+        asyncio.create_task(run_webhook_server_async())
+        logger.info(f"🌐 Webhook server (async) start requested on port {WORKER_PORT}")
         
         # Запускаем мониторинг задач
         await task_manager.start_monitoring()
