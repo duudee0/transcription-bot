@@ -10,10 +10,11 @@ import sys
 import time
 from typing import Optional, Dict, Any, Set
 from dataclasses import dataclass
-from aio_pika import connect_robust, Message, IncomingMessage
+from aio_pika import connect_robust, Message, IncomingMessage, DeliveryMode
 from uuid import uuid4
 import httpx
 
+from publisher import Publisher
 # Импортируем наши модели
 from common.models import TaskMessage, ResultMessage, ResultData, MessageType
 
@@ -21,6 +22,11 @@ from common.models import TaskMessage, ResultMessage, ResultData, MessageType
 RABBIT_URL = os.getenv("RABBIT_URL", "amqp://guest:guest@rabbitmq:5672/")
 QUEUE_NAME = os.getenv("QUEUE_NAME", "tasks")
 RESULT_QUEUE = os.getenv("RESULT_QUEUE", "results")
+
+# Републикация поломанных заданий
+RETRY_HEADER = "x-retries"
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+
 SEND_METHOD = os.getenv("SEND_METHOD", "http")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "5.0"))
 WORKER_NAME = os.getenv("WORKER_NAME", "generic-worker")
@@ -576,7 +582,7 @@ async def process_task(task: TaskMessage) -> Optional[ResultMessage]:
             )
         )
 
-async def handle_message(msg: IncomingMessage):
+async def handle_message(msg: IncomingMessage, publisher: Publisher):
     """Обработка с проверкой состояния сервисов"""
     try:
         body = msg.body.decode("utf-8")
@@ -601,10 +607,48 @@ async def handle_message(msg: IncomingMessage):
         logger.info(f"🎯 Target service: {service_name}")
         
         # ПРОВЕРЯЕМ ГОТОВНОСТЬ СЕРВИСА
-        if not await check_service_ready(service_config):
-            logger.warning(f"⏸️ Service {service_name} not ready, requeuing...")
-            await asyncio.sleep(5)
-            await msg.nack(requeue=True)
+        ready = await check_service_ready(service_config)
+        if not ready:
+            logger.warning(f"⏸️ Service {service_name} not ready — will requeue to tail")
+
+            # подготовка attempts и headers
+            headers = dict(msg.headers) if msg.headers and isinstance(msg.headers, dict) else {}
+            attempts = int(headers.get("x-retries", 0)) + 1
+            headers["x-retries"] = attempts
+
+            logger.warning(f" + exceeded for {task_message.message_id} (attempts={attempts}) — sending failure")
+
+            if attempts >= MAX_RETRIES:
+                logger.error(f"❌ Max retries exceeded for {task_message.message_id} (attempts={attempts}) — sending failure")
+                try:
+                    await msg.ack()
+                except Exception:
+                    logger.exception("Failed to ack message before publishing result")
+
+                result_message = ResultMessage(
+                    source_service=WORKER_NAME,
+                    target_service=task_message.source_service,
+                    original_message_id=task_message.message_id,
+                    data=ResultData(
+                        success=False,
+                        error_message=f"Service {service_name} unavailable after {attempts} attempts",
+                        execution_metadata={"worker": WORKER_NAME, "service": service_name, "retries": attempts}
+                    )
+                )
+                # используем publisher чтобы отправить result
+                # Попытаемся опубликовать результат, но ошибка публикации не должна
+                # приводить к попытке nack на уже ack'нутом сообщении.
+                try:
+                    await publisher.publish_result(result_message)
+                except Exception as e:
+                    logger.exception("Failed to publish result for %s: %s", task_message.message_id, e)
+                    # Возможные опции:
+                    # - логируем и возвращаем (мы уже ack'нули исходное сообщение)
+                    # - сохраняем результат в локальный файл/базу как запасной вариант
+                return
+
+            # републикуем в хвост (publish -> ack)
+            await publisher.requeue_to_tail(msg.body, headers)
             return
         
         # Обрабатываем задачу
@@ -699,18 +743,26 @@ async def main():
         # Подключаемся к RabbitMQ
         connection = await connect_robust(RABBIT_URL)
         async with connection:
-            channel = await connection.channel()
-            await channel.set_qos(prefetch_count=1)  # Обрабатываем по одной задаче
+            # создаём publisher, который лениво создаст канал при первом publish
+            publisher = Publisher(connection, prefetch=int(os.getenv("PREFETCH_COUNT", "5")))
 
-            # Убедимся, что очереди существуют
+            # Если тебе нужно, чтобы task_manager мог публиковать результаты:
+            task_manager.publisher = publisher
+
+            # Для consumer мы используем partial, чтобы передать publisher в handler
+            import functools
+            handler = functools.partial(handle_message, publisher=publisher)
+
+            # канал на потребление можно взять локально:
+            channel = await connection.channel()
+            await channel.set_qos(prefetch_count=int(os.getenv("PREFETCH_COUNT", "5")))
+
             await channel.declare_queue(QUEUE_NAME, durable=True)
             await channel.declare_queue(RESULT_QUEUE, durable=True)
 
             queue = await channel.get_queue(QUEUE_NAME)
-            logger.info(f"🎯 Waiting for typed messages on '{QUEUE_NAME}'...")
-            await queue.consume(handle_message)
+            await queue.consume(handler)
 
-            # Держим программу живой
             await asyncio.Future()
             
     except Exception as e:
