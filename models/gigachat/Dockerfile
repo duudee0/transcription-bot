@@ -6,6 +6,8 @@ ENV PYTHONUNBUFFERED=1
 # Копируем общие модели
 COPY common /app/common
 
+COPY models/common /app/models/common
+
 # Копируем код сервиса
 COPY models/gigachat /app
 
@@ -13,4 +15,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+CMD ["python", "main.py"]
