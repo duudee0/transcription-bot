@@ -56,9 +56,6 @@ logger = logging.getLogger("typed-worker")
 
 print(f"🚀 Typed worker '{WORKER_NAME}' starting...", file=sys.stderr)
 
-# =============================================================================
-# НОВЫЙ КОД: Менеджер асинхронных задач
-# =============================================================================
 
 @dataclass
 class AsyncTaskState:
@@ -79,6 +76,8 @@ class AsyncTaskManager:
         self.max_wait_time = 3600  # 1 час максимум
         self.check_interval = 5   # проверка каждые 30 секунд
         self.max_attempts = 3
+        self._semaphore = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT_ASYNC", "5")))
+
         
     async def start_monitoring(self):
         """Запускает фоновый мониторинг задач"""
@@ -207,10 +206,11 @@ class AsyncTaskManager:
                     }
                 )
             )
-            # Удаляем из активных задач
-            self.active_tasks.pop(task_id)
-
+            
             await send_to_result_queue(result_message)
+            # Удаляем из активных задач
+            # финализируем и освобождаем семафор
+            await self._finalize_task(task_id)
     
     async def _handle_task_failed(self, task_id: str, error: str):
         """Обработка неудачной задачи"""
@@ -231,6 +231,8 @@ class AsyncTaskManager:
                 )
             )
             await send_to_result_queue(result_message)
+            # финализируем и освобождаем семафор
+            await self._finalize_task(task_id)
     
     async def _handle_task_timeout(self, task_id: str):
         """Обработка таймаута задачи"""
@@ -252,6 +254,8 @@ class AsyncTaskManager:
                 )
             )
             await send_to_result_queue(result_message)
+            # финализируем и освобождаем семафор
+            await self._finalize_task(task_id)
     
     async def _handle_service_down(self, task_id: str):
         """Обработка недоступности сервиса"""
@@ -273,9 +277,22 @@ class AsyncTaskManager:
                 )
             )
             await send_to_result_queue(result_message)
+            await self._finalize_task(task_id)
+
     
-    def register_async_task(self, task: TaskMessage, service_config: Dict):
-        """Регистрирует задачу для асинхронного отслеживания"""
+    async def _finalize_task(self, task_id: str):
+        """Снять задачу и освободить слот семафора — вернуть state или None."""
+        task_state = self.active_tasks.pop(task_id, None)
+        if task_state:
+            try:
+                self._semaphore.release()
+            except ValueError:
+                logger.warning(f"Semaphore release issue for {task_id}")
+        return task_state
+
+    async def register_async_task(self, task: TaskMessage, service_config: Dict):
+        """Register async task but obey semaphore limits (await this)."""
+        await self._semaphore.acquire()
         task_id = str(task.message_id)
         self.active_tasks[task_id] = AsyncTaskState(
             task=task,
@@ -284,29 +301,34 @@ class AsyncTaskManager:
             last_check=time.time(),
             status="waiting"
         )
-        logger.info(f"📝 Registered async task: {task_id}")
+        logger.info(f"📝 Registered async task: {task_id} (active={len(self.active_tasks)})")
+
     
     async def handle_webhook(self, message_id: str, payload: dict) -> bool:
         """Обрабатывает вебхук уведомление"""
         task_state = self.active_tasks.get(message_id)
-        
         if not task_state:
             logger.warning(f"🤔 Webhook for unknown task: {message_id}")
             return False
-        
+
         task_state.callback_received = True
         task_state.last_check = time.time()
-        
-        if payload.get("success") != True:
+
+        # Примем несколько форматов: {"status":"completed"} или {"success":true}
+        success_flag = payload.get("data").get("success")
+
+        if success_flag is True:
             logger.info(f"✅ Webhook: task {message_id} completed")
             await self._handle_task_completed(message_id, payload.get("result", {}))
             return True
-        else:
+        elif success_flag is False or payload.get("error"):
             logger.error(f"❌ Webhook: task {message_id} failed")
             await self._handle_task_failed(message_id, payload.get("error_message", "Unknown error"))
             return True
-        
-        return False
+
+        # Если webhook пришёл, но не определён статус — просто отмечаем callback_received (монитор может дальше проверять)
+        logger.info(f"ℹ️ Webhook for {message_id} received but status unknown; will be polled")
+        return True
 
 # Глобальный менеджер задач
 task_manager = AsyncTaskManager()
@@ -407,17 +429,13 @@ async def send_via_http(url: str, payload: dict) -> dict:
             
             logger.info(f"📡 HTTP Response: {resp.status_code} in {response_time:.2f}s")
             
-            resp.raise_for_status()
-            
+            # Попробуем распарсить JSON; если не JSON — вернём текст
             try:
-                result = resp.json()
-                logger.debug(f"✅ JSON response received from {url}")
-                return result
-            except Exception as e:
-                raw_text = (await resp.aread()).decode(errors="ignore")
-                logger.warning(f"⚠️ Non-JSON response from {url}: {e}")
-                logger.debug(f"   Raw response: {raw_text[:200]}...")
-                return {"status": "ok", "raw_text": raw_text}
+                body = resp.json()
+            except Exception:
+                body = (await resp.aread()).decode(errors="ignore")
+
+            return {"status_code": resp.status_code, "body": body}
                 
         except httpx.TimeoutException:
             error_msg = f"Timeout after {HTTP_TIMEOUT}s connecting to {url}"
@@ -512,13 +530,37 @@ async def process_task(task: TaskMessage) -> Optional[ResultMessage]:
                 )
             )
         
-        # Отправляем задачу с вебхуком
-        logger.info(f"🔔 Using webhook for task {task.message_id}")
-        task_manager.register_async_task(task, service_config)   
+        status_code = int(service_result.get("status_code", 0))
+        body = service_result.get("body")
 
-        # Если задача была отправлена асинхронно, возвращаем None - результат придет через вебхук
-        logger.info(f"⏳ Task {task.message_id} processing asynchronously")
-        return None
+        # Если сервер вернул ошибку — сразу возвращаем ошибку
+        # (эта проверка уже была выше по "error" ключу, но на всякий случай)
+        if status_code >= 400:
+            return ResultMessage(
+                source_service=WORKER_NAME,
+                target_service=task.source_service,
+                original_message_id=task.message_id,
+                data=ResultData(
+                    success=False,
+                    error_message=f"Service returned status {status_code}",
+                    execution_metadata={"worker": WORKER_NAME, "service": service_name}
+                )
+            )
+
+        # Решение: если сервис вернул 202 или явно отметил 'accepted'/'queued' -> регистрируем async
+        accepted = False
+        if status_code in (200, 201, 202):
+            # если тело содержит явный индикатор
+            accepted = True
+
+        logger.info(f"⚙️ HTTP request to {service_name}: {str(status_code)}")
+        if accepted:
+            # Отправляем задачу с вебхуком
+            logger.info(f"🔔 Using webhook for task {task.message_id}")
+            await task_manager.register_async_task(task, service_config)   
+            # Если задача была отправлена асинхронно, возвращаем None - результат придет через вебхук
+            logger.info(f"⏳ Task {task.message_id} processing asynchronously")
+            return None
 
         
     except Exception as e:
@@ -594,7 +636,7 @@ async def webhook_handler(message_id: str, request: Request):
     """Обрабатывает вебхук уведомления от сервисов"""
     try:
         payload = await request.json()
-        logger.info(f"📬 Webhook received for {message_id}: {payload.get('success', 'unknown')}")
+        logger.info(f"📬 Webhook received for {message_id}: {payload.get('data').get('success', 'false')}")
         
         # Передаем в менеджер задач
         processed = await task_manager.handle_webhook(message_id, payload)
@@ -602,7 +644,7 @@ async def webhook_handler(message_id: str, request: Request):
         if processed:
             return {"status": "processed"}
         else:
-            logger.error(f"☢️ Webhook ignoring request: {str(payload)}")
+            logger.error(f"☢️ Webhook ignoring request: {str(payload)} \n + processed: {str(processed)}")
             return {"status": "ignored"}
             
     except Exception as e:
