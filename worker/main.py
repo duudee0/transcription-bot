@@ -618,12 +618,15 @@ async def handle_message(msg: IncomingMessage, publisher: Publisher):
 
             logger.warning(f" + exceeded for {task_message.message_id} (attempts={attempts}) — sending failure")
 
+            # Убираем из очереди
+            try:
+                await msg.ack()
+            except Exception:
+                logger.exception(" ⛔⛔ Failed to ack message before publishing result")
+
+
             if attempts >= MAX_RETRIES:
                 logger.error(f"❌ Max retries exceeded for {task_message.message_id} (attempts={attempts}) — sending failure")
-                try:
-                    await msg.ack()
-                except Exception:
-                    logger.exception("Failed to ack message before publishing result")
 
                 result_message = ResultMessage(
                     source_service=WORKER_NAME,

@@ -102,6 +102,7 @@ class Publisher:
         Возвращает None или бросает исключение при ошибке.
         (Здесь мы не сами ack — это ответственность вызывающего.)
         """
+        logger.warning(f" ⤴️ Republish: headers: {str(headers)}")
         await self.publish_message(body=msg_body, routing_key=self._default_queue_name(), headers=headers)
 
     def _default_queue_name(self) -> str:
