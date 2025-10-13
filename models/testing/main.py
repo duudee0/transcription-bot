@@ -4,6 +4,8 @@ from fastapi import HTTPException
 import asyncio
 from typing import Dict, Any
 
+# ТЕСТОВАЯ ЗАДЕРЖКА УКАЗЫВАТЬ
+TESTING_SLEEP = 20
 
 class LLMService(BaseService):
     """LLM Service с тестовой реализацией"""
@@ -18,7 +20,7 @@ class LLMService(BaseService):
     
     async def _process_task_logic(self, task_message: TaskMessage) -> ResultData:
         """Логика обработки задачи для LLM сервиса"""
-        await asyncio.sleep(2)  # Имитация обработки
+        await asyncio.sleep(TESTING_SLEEP)  # Имитация обработки
         
         task_type = task_message.data.task_type
         input_data = task_message.data.input_data
