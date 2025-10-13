@@ -10,6 +10,8 @@ logger = logging.getLogger("typed-worker.publisher")
 
 
 DEFAULT_RESULT_QUEUE = os.getenv("RESULT_QUEUE", "results")
+DEFAULT_RETRY_TTL_MS = int(os.getenv("RETRY_TTL_MS", "5000"))   # 5s
+DEFAULT_RETRY_QUEUE = os.getenv("RETRY_QUEUE", f"{os.getenv('QUEUE_NAME','tasks')}_retry")
 DEFAULT_PREFETCH = 5
 
 class Publisher:
@@ -30,6 +32,11 @@ class Publisher:
         self._prefetch = prefetch
         # internal lock to avoid races when (re)creating channel
         self._channel_lock = asyncio.Lock()
+        
+        # Кэш для single retry queue
+        self._retry_queue_declared: bool = False
+        self._retry_queue_name: Optional[str] = None
+
 
     async def _ensure_channel(self) -> Channel:
         """
@@ -52,6 +59,34 @@ class Publisher:
                 logger.debug("Publisher: set_qos failed (ignored)")
             return self._channel
 
+    # Очередь для задач который пока что нельзя выполнить с фиксированным ttl ожидания
+    async def ensure_single_retry_queue(self, retry_queue_name: str, ttl_ms: int, dead_letter_routing_key: Optional[str]):
+        """Declare single retry queue (idempotent). Uses a boolean flag to avoid repeated declares."""
+        if self._retry_queue_declared and self._retry_queue_name == retry_queue_name:
+            return
+
+        ch = await self._ensure_channel()
+        args = {"x-message-ttl": int(ttl_ms)}
+        if dead_letter_routing_key:
+            args["x-dead-letter-exchange"] = ""
+            args["x-dead-letter-routing-key"] = dead_letter_routing_key
+
+        await ch.declare_queue(retry_queue_name, durable=True, arguments=args)
+        self._retry_queue_declared = True
+        self._retry_queue_name = retry_queue_name
+
+    async def publish_to_retry_single(self, body: bytes, headers: Optional[Dict[str, Any]] = None, retry_queue_name: str = DEFAULT_RETRY_QUEUE):
+        # ленивое объявление: если очередь ещё не отмечена как объявленная — объявляем с дефолтами
+        if not self._retry_queue_declared or self._retry_queue_name != retry_queue_name:
+            main_q = os.getenv("QUEUE_NAME", "tasks")
+            await self.ensure_single_retry_queue(retry_queue_name=retry_queue_name, ttl_ms=int(os.getenv("RETRY_TTL_MS", DEFAULT_RETRY_TTL_MS)), dead_letter_routing_key=main_q)
+
+        ch = await self._ensure_channel()
+        msg_headers = dict(headers) if headers and isinstance(headers, dict) else {}
+        msg = Message(body, headers=msg_headers, delivery_mode=DeliveryMode.PERSISTENT)
+        await ch.default_exchange.publish(msg, routing_key=retry_queue_name)
+
+    # Закинуть задачу в таски обратно    
     async def publish_message(self, body: bytes, routing_key: str,
                               headers: Optional[Dict[str, Any]] = None,
                               priority: Optional[int] = None) -> None:

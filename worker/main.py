@@ -332,22 +332,17 @@ async def handle_message(msg: IncomingMessage, publisher: Publisher):
         
         # ПРОВЕРЯЕМ ГОТОВНОСТЬ СЕРВИСА
         ready = await check_service_ready(service_config)
-        if ready == None: # Если контейнер просто мертв
-            logger.warning(f"⏸️ Service {service_name} not ready — will requeue to tail")
 
+        if not ready:
             # подготовка attempts и headers
             headers = dict(msg.headers) if msg.headers and isinstance(msg.headers, dict) else {}
             attempts = int(headers.get(RETRY_HEADER, 0)) + 1
-            headers[RETRY_HEADER] = attempts
+            headers[RETRY_HEADER] = attempts            
+
+        if ready == None: # Если контейнер просто мертв
+            logger.warning(f"⏸️ Service {service_name} not ready — will requeue to tail")
 
             logger.warning(f" + exceeded for {task_message.message_id} (attempts={attempts}) — sending failure")
-
-            # Убираем из очереди
-            try:
-                await msg.ack()
-            except Exception:
-                logger.exception(" ⛔⛔ Failed to ack message before publishing result")
-
 
             if attempts >= MAX_RETRIES:
                 logger.error(f"❌ Max retries exceeded for {task_message.message_id} (attempts={attempts}) — sending failure")
@@ -367,23 +362,33 @@ async def handle_message(msg: IncomingMessage, publisher: Publisher):
                 # приводить к попытке nack на уже ack'нутом сообщении.
                 try:
                     await publisher.publish_result(result_message)
+                    # Убираем из очереди
+                    try:
+                        await msg.ack()
+                    except Exception:
+                        logger.exception(" ⛔⛔ Failed to ack message before publishing result")
+
                 except Exception as e:
                     logger.exception("Failed to publish result for %s: %s", task_message.message_id, e)
                     # Возможные опции:
                     # - логируем и возвращаем (мы уже ack'нули исходное сообщение)
                     # - сохраняем результат в локальный файл/базу как запасной вариант
                 return
-
-            # републикуем в хвост (publish -> ack)
-            await publisher.requeue_to_tail(msg.body, headers)
-            return
         
         # Если просто занят 
         elif ready == False:
             #TODO: ЛОГИКА ЕСЛИ ЗАНЯТ ПРОСТО, НАДО ДОБАВИТЬ СУПЕР МАКСИМАЛЬНОЕ ВРЕМЯ ОТВЕТА
             logger.info(f" Service {service_name} is busy")
-            await asyncio.sleep(5)
-            await msg.nack(requeue=True)
+            #await msg.nack(requeue=True)
+        
+        if not ready:
+            # Убираем из очереди и кладем на ожидание
+            try:
+                await publisher.publish_to_retry_single(body=msg.body, headers=headers)
+                await msg.ack()
+            except Exception:
+                logger.exception(" ⛔⛔ Failed to ack message before publishing result")
+
             return
         
         # Обрабатываем задачу
@@ -475,8 +480,27 @@ async def main():
             # создаём publisher, который лениво создаст канал при первом publish
             publisher = Publisher(connection, prefetch=int(os.getenv("PREFETCH_COUNT", "5")))
 
+            retry_queue = os.getenv("RETRY_QUEUE", f"{os.getenv('QUEUE_NAME','tasks')}_retry")
+            retry_ttl = int(os.getenv("RETRY_TTL_MS", "5000"))  # миллисекунды, 5000 = 5s
+
+            # Создаем заранее очередь для повтора тасков
+            try:
+                # объявляем единую retry-очередь: TTL -> вернёт в основную очередь через DLX
+                await publisher.ensure_single_retry_queue(
+                    retry_queue_name=retry_queue,
+                    ttl_ms=retry_ttl,
+                    dead_letter_routing_key=os.getenv("QUEUE_NAME", "tasks")
+                )
+                logger.info("Retry queue ensured: %s (ttl=%sms)", retry_queue, retry_ttl)
+            except Exception as e:
+                # решай по политике: fail-fast или продолжать без retry
+                logger.exception("Failed to ensure retry queue; continuing but retries may fail: %s", e)
+
+                # -> можно raise, если хочешь остановить стартап при ошибке
             # Если тебе нужно, чтобы task_manager мог публиковать результаты:
             task_manager.publisher = publisher
+
+
 
             # Для consumer мы используем partial, чтобы передать publisher в handler
             import functools
