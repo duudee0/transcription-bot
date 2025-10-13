@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1
 # Копируем общие модели
 COPY common /app/common
 
-COPY models/common /app/models/common
+COPY models/common /app/common
 
 # Копируем код сервиса
 COPY models/gigachat /app

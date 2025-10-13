@@ -1,4 +1,4 @@
-from models.common.base_service import BaseService
+from common.base_service import BaseService
 from common.models import TaskMessage, ResultData
 from fastapi import HTTPException
 import os
