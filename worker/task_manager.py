@@ -3,7 +3,7 @@ import time
 import asyncio
 import logging
 import httpx
-
+from aio_pika import IncomingMessage
 from typing import Dict, Any, Optional
 from dataclasses import dataclass
 
@@ -27,6 +27,7 @@ async def send_to_result_queue(result_message: ResultMessage):
 @dataclass
 class AsyncTaskState:
     """Состояние асинхронной задачи"""
+    message: IncomingMessage
     task: TaskMessage
     service_config: Dict[str, Any]
     start_time: float
@@ -188,6 +189,13 @@ class AsyncTaskManager:
         )
 
         try:
+            # ПОДТВЕРЖДАЕМ СООБЩЕНИЕ ТОЛЬКО ЗДЕСЬ
+            await task_state.message.ack()
+            logger.info(f"✅ Message acknowledged for completed task {task_id}")
+        except Exception as e:
+            logger.exception("⛔ Failed to ack service-down result for task %s: %s", task_id, e)
+
+        try:
             if self.publisher:
                 await self.publisher.publish_result(result_message)
             else:
@@ -218,6 +226,13 @@ class AsyncTaskManager:
                 }
             )
         )
+
+        try:
+            # ПОДТВЕРЖДАЕМ СООБЩЕНИЕ ТОЛЬКО ЗДЕСЬ
+            await task_state.message.nack(requeue=True) # Вернуть в очередь
+            logger.info(f"✅ Message acknowledged for completed task {task_id}")
+        except Exception as e:
+            logger.exception("⛔ Failed to ack service-down result for task %s: %s", task_id, e)
 
         try:
             if self.publisher:
@@ -253,6 +268,13 @@ class AsyncTaskManager:
         )
 
         try:
+            # ПОДТВЕРЖДАЕМ СООБЩЕНИЕ ТОЛЬКО ЗДЕСЬ
+            await task_state.message.nack(requeue=True) # Вернуть в очередь
+            logger.info(f"✅ Message acknowledged for completed task {task_id}")
+        except Exception as e:
+            logger.exception("⛔ Failed to ack service-down result for task %s: %s", task_id, e)
+
+        try:
             if self.publisher:
                 await self.publisher.publish_result(result_message)
             else:
@@ -286,6 +308,12 @@ class AsyncTaskManager:
         )
 
         try:
+            # ПОДТВЕРЖДАЕМ СООБЩЕНИЕ ТОЛЬКО ЗДЕСЬ
+            await task_state.message.nack(requeue=True) # Вернуть в очередь
+            logger.info(f"✅ Message acknowledged for completed task {task_id}")
+        except Exception as e:
+            logger.exception("⛔ Failed to ack service-down result for task %s: %s", task_id, e)
+        try:
             if self.publisher:
                 await self.publisher.publish_result(result_message)
             else:
@@ -308,11 +336,12 @@ class AsyncTaskManager:
                 logger.warning(f"Semaphore release issue for {task_id}")
         return task_state
 
-    async def register_async_task(self, task: TaskMessage, service_config: Dict):
+    async def register_async_task(self, task: TaskMessage, service_config: Dict, message: IncomingMessage):
         """Register async task but obey semaphore limits (await this)."""
         await self._semaphore.acquire()
         task_id = str(task.message_id)
         self.active_tasks[task_id] = AsyncTaskState(
+            message=message,
             task=task,
             service_config=service_config,
             start_time=time.time(),

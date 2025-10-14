@@ -193,7 +193,7 @@ async def send_via_http(url: str, payload: dict) -> dict:
 
 
 
-async def process_task(task: TaskMessage) -> Optional[ResultMessage]:
+async def process_task(task: TaskMessage, msg: IncomingMessage) -> Optional[ResultMessage]:
     """Логика обработки задачи с гарантированным возвратом"""
     logger.info(f"🔄 Starting task processing: {task.message_id}")
     
@@ -285,7 +285,7 @@ async def process_task(task: TaskMessage) -> Optional[ResultMessage]:
             # если тело содержит явный индикатор
             # Отправляем задачу с вебхуком
             logger.info(f"🔔 Using webhook for task {task.message_id}")
-            await task_manager.register_async_task(task, service_config)   
+            await task_manager.register_async_task(task, service_config, msg)   
             # Если задача была отправлена асинхронно, возвращаем None - результат придет через вебхук
             logger.info(f"⏳ Task {task.message_id} processing asynchronously")
             return None
@@ -389,10 +389,10 @@ async def handle_message(msg: IncomingMessage, publisher: Publisher):
             return
         
         # Обрабатываем задачу
-        result_message = await process_task(task_message)
+        result_message = await process_task(task_message, msg)
         
         # Подтверждаем сообщение
-        await msg.ack()
+        #await msg.ack()
                 
     except Exception as e:
         logger.error(f"❌ Message processing failed: {e}")
