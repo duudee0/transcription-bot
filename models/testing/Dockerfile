@@ -3,7 +3,7 @@ FROM python:3.13.7-slim
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 
-COPY common /app/common
+COPY common/models.py /app/common/models.py
 
 COPY models/common /app/common
 

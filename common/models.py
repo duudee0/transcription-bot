@@ -157,6 +157,7 @@ restored_task = TaskMessage.model_validate_json(json_string)
   "message_id": "123e4567-e89b-12d3-a456-426614174001",
   "message_type": "task", 
   "source_service": "test-client",
+  "target_service": "llm-service",
   "timestamp": "2024-01-15T10:35:00.000Z",
   "version": "1.0",
   "data": {

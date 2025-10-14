@@ -4,7 +4,7 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 
 # Копируем общие модели
-COPY common /app/common
+COPY common/models.py /app/common/models.py
 
 COPY models/common /app/common
 

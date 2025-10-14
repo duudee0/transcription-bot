@@ -8,19 +8,21 @@ import os
 import json
 import sys
 import time
+import functools
+import httpx
 from typing import Optional, Dict, Any, Set
 from aio_pika import connect_robust, Message, IncomingMessage, DeliveryMode
 from uuid import uuid4
-import httpx
-
-from publisher import Publisher
-from task_manager import AsyncTaskManager, send_to_result_queue
-# Импортируем наши модели
-from common.models import TaskMessage, ResultMessage, ResultData, MessageType
-
-# FastAPI для вебхуков 
+# FastAPI и uvicorn для вебхуков 
 from fastapi import FastAPI, Request, HTTPException
 import uvicorn
+
+# Общие модули
+from common.models import TaskMessage, ResultMessage, ResultData, MessageType
+from common.publisher import Publisher
+
+from task_manager import AsyncTaskManager, send_to_result_queue
+
 
 # Конфиг через env
 RABBIT_URL = os.getenv("RABBIT_URL", "amqp://guest:guest@rabbitmq:5672/")
@@ -261,7 +263,6 @@ async def process_task(task: TaskMessage) -> Optional[ResultMessage]:
             )
         
         status_code = int(service_result.get("status_code", 0))
-        body = service_result.get("body")
 
         # Если сервер вернул ошибку — сразу возвращаем ошибку
         # (эта проверка уже была выше по "error" ключу, но на всякий случай)
@@ -276,22 +277,18 @@ async def process_task(task: TaskMessage) -> Optional[ResultMessage]:
                     execution_metadata={"worker": WORKER_NAME, "service": service_name}
                 )
             )
+        
+        logger.info(f"⚙️ HTTP request to {service_name}: {str(status_code)}")
 
         # Решение: если сервис вернул 202 или явно отметил 'accepted'/'queued' -> регистрируем async
-        accepted = False
         if status_code in (200, 201, 202):
             # если тело содержит явный индикатор
-            accepted = True
-
-        logger.info(f"⚙️ HTTP request to {service_name}: {str(status_code)}")
-        if accepted:
             # Отправляем задачу с вебхуком
             logger.info(f"🔔 Using webhook for task {task.message_id}")
             await task_manager.register_async_task(task, service_config)   
             # Если задача была отправлена асинхронно, возвращаем None - результат придет через вебхук
             logger.info(f"⏳ Task {task.message_id} processing asynchronously")
             return None
-
         
     except Exception as e:
         logger.error(f"💥 Unexpected error in process_task: {e}", exc_info=True)
@@ -396,12 +393,6 @@ async def handle_message(msg: IncomingMessage, publisher: Publisher):
         
         # Подтверждаем сообщение
         await msg.ack()
-
-        # Если есть синхронный результат - отправляем его
-        if result_message:
-            await send_to_result_queue(result_message)
-            if result_message.data.error_message:
-                logger.error(f"❌ Error: {result_message.data.error_message}")
                 
     except Exception as e:
         logger.error(f"❌ Message processing failed: {e}")
@@ -477,43 +468,35 @@ async def main():
         # Подключаемся к RabbitMQ
         connection = await connect_robust(RABBIT_URL)
         async with connection:
-            # создаём publisher, который лениво создаст канал при первом publish
-            publisher = Publisher(connection, prefetch=int(os.getenv("PREFETCH_COUNT", "5")))
-
-            retry_queue = os.getenv("RETRY_QUEUE", f"{os.getenv('QUEUE_NAME','tasks')}_retry")
-            retry_ttl = int(os.getenv("RETRY_TTL_MS", "5000"))  # миллисекунды, 5000 = 5s
+            declare = os.getenv("PUBLISHER_DECLARE", "true").lower() in ("1","true","yes")
+            publisher = Publisher(
+                connection,
+                prefetch=int(os.getenv("PREFETCH_COUNT", "5")),
+                declare_queues=declare,
+                retry_queue_name=os.getenv("RETRY_QUEUE", f"{os.getenv('QUEUE_NAME','tasks')}_retry"),
+                retry_ttl_ms=int(os.getenv("RETRY_TTL_MS", "5000")),
+            )
 
             # Создаем заранее очередь для повтора тасков
-            try:
-                # объявляем единую retry-очередь: TTL -> вернёт в основную очередь через DLX
-                await publisher.ensure_single_retry_queue(
-                    retry_queue_name=retry_queue,
-                    ttl_ms=retry_ttl,
-                    dead_letter_routing_key=os.getenv("QUEUE_NAME", "tasks")
-                )
-                logger.info("Retry queue ensured: %s (ttl=%sms)", retry_queue, retry_ttl)
-            except Exception as e:
-                # решай по политике: fail-fast или продолжать без retry
-                logger.exception("Failed to ensure retry queue; continuing but retries may fail: %s", e)
+            if declare:
+                try:
+                    await publisher.ensure_single_retry_queue()
+                except Exception:
+                    logger.exception("Failed to ensure retry queue on startup")
 
-                # -> можно raise, если хочешь остановить стартап при ошибке
-            # Если тебе нужно, чтобы task_manager мог публиковать результаты:
-            task_manager.publisher = publisher
+            #task_manager.publisher = publisher
 
+            # start monitoring
+            await task_manager.start_monitoring()
 
-
-            # Для consumer мы используем partial, чтобы передать publisher в handler
-            import functools
-            handler = functools.partial(handle_message, publisher=publisher)
-
-            # канал на потребление можно взять локально:
+            # create consumer channel and handler as before, pass publisher into handle_message if needed
             channel = await connection.channel()
             await channel.set_qos(prefetch_count=int(os.getenv("PREFETCH_COUNT", "5")))
+            await channel.declare_queue(os.getenv("QUEUE_NAME", "tasks"), durable=True)
+            await channel.declare_queue(os.getenv("RESULT_QUEUE", "results"), durable=True)
 
-            await channel.declare_queue(QUEUE_NAME, durable=True)
-            await channel.declare_queue(RESULT_QUEUE, durable=True)
-
-            queue = await channel.get_queue(QUEUE_NAME)
+            queue = await channel.get_queue(os.getenv("QUEUE_NAME", "tasks"))
+            handler = functools.partial(handle_message, publisher=publisher)  # если handle_message принимает publisher
             await queue.consume(handler)
 
             await asyncio.Future()
