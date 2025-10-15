@@ -99,6 +99,25 @@ services:
     networks:
       - internal
 
+  wrapper:
+    build:
+      context: .
+      dockerfile: wrapper/Dockerfile
+    environment:
+      - RABBIT_URL=amqp://guest:guest@rabbitmq:5672/
+      - PORT=8003
+    ports:
+      - "8003:8003"   # только для локальной разработки; в prod можно убрать      
+    depends_on:
+      - rabbitmq
+      #- llm-service
+    command: sh -c "sleep 7 && exec python main.py"
+
+    networks:
+      - internal
+      - frontend
+
+
 networks:
   frontend:
   internal:

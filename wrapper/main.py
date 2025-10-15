@@ -36,7 +36,7 @@ logger = logging.getLogger("task-api")
 # Конфигурация
 RABBIT_URL = os.getenv("RABBIT_URL", "amqp://guest:guest@rabbitmq:5672/")
 API_HOST = "0.0.0.0"
-API_PORT = int(os.getenv("WORKER_PORT", "8777"))
+API_PORT = int(os.getenv("WORKER_PORT", "8003"))
 
 # Модели Pydantic для API
 class TaskStatus(str, Enum):
@@ -417,7 +417,7 @@ async def lifespan(app: FastAPI):
 
 # Создание FastAPI приложения
 app = FastAPI(
-    title="Task Management API",
+    title="Wrapper API",
     description="Микросервис для управления асинхронными задачами через RabbitMQ",
     version="1.0.0",
     lifespan=lifespan
@@ -683,10 +683,10 @@ async def internal_server_error_handler(request, exc):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "task_api:app",
+        app,
         host=API_HOST,
         port=API_PORT,
-        reload=True
+        #reload=True
     )
 
 '''
@@ -703,6 +703,9 @@ curl -X POST "http://localhost:8000/tasks" \\
       "model": "gpt-3.5-turbo"
     }
   }'
+
+  # просто ctrl+c ctrl+v в терминал
+curl -X POST "http://localhost:8003/tasks" -H "Content-Type: application/json" -d '{"task_type": "analyze_text", "input_data": {"text": "Привет, мир!", "language": "ru"}, "parameters": {"model": "gpt-3.5turbo"}}'  
 
 # 2. Проверка статуса задачи
 curl "http://localhost:8000/tasks/ВАШ_TASK_ID"
