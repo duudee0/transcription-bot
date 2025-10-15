@@ -34,6 +34,41 @@ services:
   #   networks:
   #     - internal
 
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: always
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    networks:
+      - internal
+
+  embedding-service:
+    build:
+      context: ./
+      dockerfile: models/embedding/Dockerfile
+    environment:
+      - PORT=8004
+    ports:
+      - "8004:8004"
+    networks:
+      - internal
+
+  vector-service:
+    build:
+      context: ./
+      dockerfile: models/vector/Dockerfile
+    ports:
+      - "8005:8005"
+    environment:
+      - PORT=8005
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+    depends_on:
+      - qdrant
+    networks:
+      - internal
+
   gigachat-service:
     build:
       context: ./

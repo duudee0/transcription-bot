@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field
 from uuid import uuid4, UUID
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 from enum import Enum
 
 """
@@ -26,6 +26,7 @@ class MessageType(str, Enum):
     RESULT = "result"      # Результат выполнения задачи
     ERROR = "error"        # Сообщение об ошибке
     STATUS = "status"      # Статус сервиса (health check, мониторинг)
+    VECTOR_OPERATION = "vector_operation"  # Новый тип
 
 
 class BaseMessage(BaseModel):
@@ -119,6 +120,32 @@ class ResultMessage(BaseMessage):
     # Данные результата выполнения
     data: ResultData
 
+
+class VectorOperationType(str, Enum):
+    STORE_VECTORS = "store_vectors"
+    SEARCH_VECTORS = "search_vectors" 
+    CREATE_COLLECTION = "create_collection"
+    GET_COLLECTION_INFO = "get_collection_info"
+
+
+class VectorData(BaseModel):
+    """Данные для векторных операций"""
+    operation_type: VectorOperationType
+    collection_name: str
+    vectors: Optional[List[List[float]]] = None
+    payloads: Optional[List[Dict[str, Any]]] = None
+    vector_ids: Optional[List[str]] = None
+    query_vector: Optional[List[float]] = None
+    search_limit: int = 10
+    score_threshold: Optional[float] = None
+    vector_size: Optional[int] = None
+    filter_conditions: Optional[Dict[str, Any]] = None
+
+
+class VectorMessage(BaseMessage):
+    """Сообщение для векторных операций"""
+    message_type: MessageType = MessageType.VECTOR_OPERATION
+    data: VectorData
 
 """
 ПРИМЕРЫ ИСПОЛЬЗОВАНИЯ:

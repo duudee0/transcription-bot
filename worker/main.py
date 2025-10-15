@@ -53,6 +53,34 @@ SERVICE_CONFIGS = {
         "base_url": "http://image-service:8000", 
         "service_name": "image-service"
     },
+    "generate_embeddings": {
+        "base_url": "http://embedding-service:8004",
+        "service_name": "embedding-service"
+    },
+    "get_embedding_dim": {
+        "base_url": "http://embedding-service:8004", 
+        "service_name": "embedding-service"
+    },
+    "create_collection": {
+        "base_url": "http://vector-service:8005",
+        "service_name": "vector-service"
+    },
+    "store_vectors": {
+        "base_url": "http://vector-service:8005",
+        "service_name": "vector-service"
+    },
+    "search_vectors": {
+        "base_url": "http://vector-service:8005",
+        "service_name": "vector-service"
+    },
+    "get_collection_info": {
+        "base_url": "http://vector-service:8005", 
+        "service_name": "vector-service"
+    },
+    "delete_vectors": {
+        "base_url": "http://vector-service:8005",
+        "service_name": "vector-service"
+    }
 }
 
 # Настройка логирования
