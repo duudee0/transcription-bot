@@ -90,7 +90,14 @@ async def check_service_ready(service_config: dict) -> bool:
             logger.debug(f"   Checking health: {health_url}")
             health_response = await client.get(health_url)
             
-            if health_response.status_code != 200:
+            try:
+                health_status = health_response.json().status == 'ok'
+            except:
+                health_status = True
+
+            logger.info(f" 🩷 Status: {health_status}")
+
+            if health_response.status_code != 200 and not health_status:
                 logger.warning(f"   ❌ Health check failed: {health_response.status_code}")
                 return None
             
@@ -411,7 +418,7 @@ async def webhook_handler(message_id: str, request: Request):
     """Обрабатывает вебхук уведомления от сервисов"""
     try:
         payload = await request.json()
-        logger.info(f"📬 Webhook received for {message_id}: {payload.get('data').get('success', 'false')}")
+        logger.info(f"📬 Webhook received for {message_id}: {payload.get('data').get('success', 'None success')}")
         
         # Передаем в менеджер задач
         processed = await task_manager.handle_webhook(message_id, payload)

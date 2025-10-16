@@ -9,7 +9,7 @@ import os
 import sys
 import asyncio
 import httpx
-from uuid import UUID
+from uuid import UUID, uuid4
 
 
 from common.publisher import Publisher
@@ -37,7 +37,7 @@ class BaseService:
         self._register_common_endpoints()
 
         # Отправка в rabbitmq
-        self.publisher = Publisher
+        self.publisher: Publisher = None
     
     def _register_common_endpoints(self):
         """Регистрирует общие эндпоинты для всех сервисов"""
@@ -64,37 +64,56 @@ class BaseService:
     
     async def ensure_publisher(self) -> Publisher:
         """Обеспечивает наличие publisher (создает при необходимости)"""
-        if self.publisher is None:
+        if self.publisher is None or not self._publisher_initialized:
             print(f"🔄 Creating RabbitMQ connection for {self.service_name}", file=sys.stderr)
-            rabbit_url = os.getenv("RABBIT_URL", "amqp://guest:guest@rabbitmq:5672/")
-            connection = await connect_robust(rabbit_url)
-            self.publisher = Publisher(connection, prefetch=5, declare_queues=True)
+            
+            try:
+                rabbit_url = os.getenv("RABBIT_URL", "amqp://guest:guest@rabbitmq:5672/")
+                print(f"   Connecting to RabbitMQ: {rabbit_url}", file=sys.stderr)
+                
+                connection = await connect_robust(rabbit_url)
+                print(f"   ✅ RabbitMQ connected for {self.service_name}", file=sys.stderr)
+                
+                self.publisher = Publisher(
+                    connection, 
+                    prefetch=5, 
+                    declare_queues=True
+                )
+                self._publisher_initialized = True
+                
+                print(f"   ✅ Publisher created for {self.service_name}", file=sys.stderr)
+                
+            except Exception as e:
+                print(f"❌ Failed to create publisher for {self.service_name}: {e}", file=sys.stderr)
+                raise
         
         return self.publisher
 
     def run(self, host: str = "0.0.0.0", port: int = 8000):
         """Синхронный запуск сервиса (совместимость с вашим текущим кодом)"""
+
         # Запускаем асинхронную инициализацию в синхронном контексте
         asyncio.run(self._run_with_publisher(host, port))
     
     async def _run_with_publisher(self, host: str, port: int):
         """Асинхронная подготовка и запуск"""
-        # Убеждаемся, что publisher создан
-        await self.ensure_publisher()
-        print(f"✅ {self.service_name} publisher initialized", file=sys.stderr)
-        
-        # Запускаем uvicorn синхронно для совместимости
-        config = uvicorn.Config(self.app, host=host, port=port)
-        server = uvicorn.Server(config)
-        await server.serve()
+        try:
+            # Убеждаемся, что publisher создан ДО запуска сервера
+            await self.ensure_publisher()
+            print(f"✅ {self.service_name} publisher initialized", file=sys.stderr)
+            
+            # Запускаем uvicorn
+            config = uvicorn.Config(self.app, host=host, port=port, log_level="info")
+            server = uvicorn.Server(config)
+            await server.serve()
+            
+        except Exception as e:
+            print(f"❌ Failed to start {self.service_name}: {e}", file=sys.stderr)
+            raise
 
     def _should_process_message(self, task_message: TaskMessage) -> bool:
         """
         ОПРЕДЕЛЯЕТ, ДОЛЖЕН ЛИ СЕРВИС ОБРАБОТАТЬ СООБЩЕНИЕ
-        
-        Новая логика с target_services:
-        - Если цепочка указана: обрабатываем только если мы первый в цепочке
-        - Если цепочка не указана: обрабатываем если можем handle task_type
         """
         if task_message.target_services:
             # Если есть цепочка, проверяем что мы первый
@@ -114,7 +133,7 @@ class BaseService:
     
     async def _process_task_handler(self, request: Request, background_tasks: BackgroundTasks) -> ResultMessage:
         """
-        ОБНОВЛЕННЫЙ ОБРАБОТЧИК ЗАДАЧ С ПОДДЕРЖКОЙ ЦЕПОЧЕК
+        ОБРАБОТЧИК ЗАДАЧ С ПОДДЕРЖКОЙ ЦЕПОЧЕК
         """
         start_time = time.time()
         
@@ -152,52 +171,35 @@ class BaseService:
             
             # Проверяем поддержку вебхука
             callback_url = task_message.data.input_data.get("callback_url")
-            webhook_supported = task_message.data.input_data.get("webhook_supported", False)
+            # webhook_supported = task_message.data.input_data.get("webhook_supported", False)
             
-            if callback_url and webhook_supported and not self.is_processing:
-                print(f"🔔 Webhook mode activated for {task_message.message_id}", file=sys.stderr)
-                
-                # Запускаем фоновую задачу
-                background_tasks.add_task(
-                    self._process_with_webhook_and_chain,
-                    task_message,
-                    callback_url
+            # if callback_url and webhook_supported and not self.is_processing:
+            print(f"🔔 Webhook mode activated for {task_message.message_id}", file=sys.stderr)
+            
+            # Запускаем фоновую задачу
+            background_tasks.add_task(
+                self._process_with_webhook_and_chain,
+                task_message,
+                callback_url
+            )
+            
+            # Немедленный ответ
+            return ResultMessage(
+                message_id=task_message.message_id,
+                message_type=MessageType.RESULT,
+                source_service=self.service_name,
+                target_services=task_message.target_services,
+                original_message_id=task_message.message_id,
+                data=ResultData(
+                    success=True,
+                    result={"status": "accepted", "message": "Processing in background via webhook"},
+                    execution_metadata={
+                        "processing_mode": "async_webhook",
+                        "service": self.service_name,
+                        "remaining_chain": self._get_remaining_chain(task_message)
+                    }
                 )
-                
-                # Немедленный ответ
-                return ResultMessage(
-                    message_id=task_message.message_id,
-                    message_type=MessageType.RESULT,
-                    source_service=self.service_name,
-                    target_services=task_message.target_services,
-                    original_message_id=task_message.message_id,
-                    data=ResultData(
-                        success=True,
-                        result={"status": "accepted", "message": "Processing in background via webhook"},
-                        execution_metadata={
-                            "processing_mode": "async_webhook",
-                            "service": self.service_name,
-                            "remaining_chain": self._get_remaining_chain(task_message)
-                        }
-                    )
-                )
-            
-            # Синхронная обработка
-            result_data = await self._process_task_sync(task_message)
-            
-            # ОБРАБОТКА ЦЕПОЧКИ: создаем сообщение для следующего сервиса если нужно
-            result_message = await self._handle_service_chain(task_message, result_data)
-            
-            # Обновляем историю
-            self.processing_history[str(task_message.message_id)]["completed_at"] = time.time()
-            self.processing_history[str(task_message.message_id)]["status"] = "completed"
-            self.processing_history[str(task_message.message_id)]["result"] = result_data.model_dump()
-            
-            processing_time = (time.time() - start_time) * 1000
-            print(f"✅ {self.service_name} processed in {processing_time:.2f}ms", file=sys.stderr)
-            print(f"  Next in chain: {result_message.target_services}", file=sys.stderr)
-            
-            return result_message
+            )
             
         except Exception as e:
             processing_time = (time.time() - start_time) * 1000
@@ -222,42 +224,104 @@ class BaseService:
     
     async def _handle_service_chain(self, task_message: TaskMessage, result_data: ResultData) -> ResultMessage:
         """
-        ОБРАБАТЫВАЕТ ЦЕПОЧКУ СЕРВИСОВ
-        
-        - Если есть следующие сервисы в цепочке, преобразует результат в задачу для следующего сервиса
-        - Если цепочка закончена, возвращает финальный результат
+        ОБРАБАТЫВАЕТ ЦЕПОЧКУ СЕРВИСОВ С ПРАВИЛЬНОЙ ОТПРАВКОЙ ВЕБХУКОВ
         """
         remaining_services = self._get_remaining_chain(task_message)
         
         if remaining_services:
-            # Есть следующие сервисы - преобразуем в задачу
+            # Есть следующие сервисы - передаем задачу дальше через RabbitMQ
             next_service = remaining_services[0]
             next_task_type = self._get_task_type_for_service(next_service)
             
-            print(f"🔄 Passing to next service: {next_service} (task: {next_task_type})", file=sys.stderr)
+            new_message_id = uuid4()
+            print(f"🔄 Chain: {self.service_name} -> {next_service}", file=sys.stderr)
             
-            # Создаем TASK сообщение для следующего сервиса
-            return TaskMessage(
-                message_id=task_message.message_id,  # сохраняем ID для трассировки
+            # Создаем новую задачу для следующего сервиса
+            next_task = TaskMessage(
+                message_id=new_message_id,
                 message_type=MessageType.TASK,
                 source_service=self.service_name,
                 target_services=remaining_services,
                 data=TaskData(
                     task_type=next_task_type,
-                    input_data=result_data.result or {},  # результат текущего сервиса = вход для следующего
-                    parameters=task_message.data.parameters  # передаем параметры дальше
+                    input_data=task_message.data.input_data,  # передаем все input_data (включая callback_url)
+                    parameters=task_message.data.parameters
                 )
             )
-        else:
-            # Цепочка закончена - возвращаем финальный результат
+            
+            # Отправляем через RabbitMQ
+            success = await self._send_task_to_next_service(next_task)
+            if not success:
+                # Если не удалось отправить, возвращаем ошибку
+                return ResultMessage(
+                    message_id=task_message.message_id,
+                    message_type=MessageType.RESULT,
+                    source_service=self.service_name,
+                    target_services=[task_message.source_service],
+                    original_message_id=task_message.message_id,
+                    data=ResultData(
+                        success=False,
+                        error_message=f"Failed to send task to next service: {next_service}",
+                        execution_metadata={"service": self.service_name, "error": True}
+                    )
+                )
+            
+            # Возвращаем промежуточный результат
             return ResultMessage(
                 message_id=task_message.message_id,
                 message_type=MessageType.RESULT,
                 source_service=self.service_name,
-                target_services=None,  # цепочка завершена
+                target_services=[task_message.source_service],
                 original_message_id=task_message.message_id,
-                data=result_data
+                data=ResultData(
+                    success=True,
+                    result={"status": "passed_to_next_service", "next_service": next_service},
+                    execution_metadata={"service": self.service_name, "chain_continued": True}
+                )
             )
+        else:
+            # МЫ ПОСЛЕДНИЙ СЕРВИС В ЦЕПОЧКЕ - отправляем финальный результат в wrapper
+            final_result = ResultMessage(
+                message_id=task_message.message_id,
+                message_type=MessageType.RESULT,
+                source_service=self.service_name,
+                target_services=None,
+                original_message_id=task_message.message_id,
+                data=ResultData(success = result_data.success)
+            )
+            
+            # Отправляем вебхук в wrapper
+            wrapper_callback_url = task_message.data.input_data.get("wrapper_callback_url")
+            if wrapper_callback_url:
+                await self._send_webhook_to_wrapper(wrapper_callback_url, final_result)
+                print(f"📤 Final result sent to wrapper: {wrapper_callback_url}", file=sys.stderr)
+            else:
+                print(f"⚠️ No wrapper_callback_url for final result", file=sys.stderr)
+            
+            return final_result
+        
+    async def _send_webhook_to_wrapper(self, wrapper_url: str, result_message: ResultMessage):
+        """Отправляет вебхук в wrapper"""
+        try:
+            print(f"📤 {self.service_name} sending final result to wrapper: {wrapper_url}", file=sys.stderr)
+            
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    wrapper_url,
+                    json=result_message.model_dump(mode='json'),
+                    headers={"Content-Type": "application/json"}
+                )
+                
+                if response.status_code == 200:
+                    print(f"✅ {self.service_name} wrapper webhook delivered", file=sys.stderr)
+                    return True
+                else:
+                    print(f"⚠️ {self.service_name} wrapper webhook failed: {response.status_code}", file=sys.stderr)
+                    return False
+                    
+        except Exception as e:
+            print(f"❌ {self.service_name} wrapper webhook ({wrapper_url}) failed: {e}", file=sys.stderr)
+            return False
     
     def _get_remaining_chain(self, task_message: TaskMessage) -> List[str]:
         """
@@ -310,12 +374,24 @@ class BaseService:
             self.processing_history[str(task_message.message_id)]["status"] = "completed"
             self.processing_history[str(task_message.message_id)]["result"] = result_data.model_dump()
             
+             
             # Если цепочка продолжается, отправляем задачу следующему сервису
             if isinstance(next_message, TaskMessage):
                 await self._send_task_to_next_service(next_message)
-            else:
-                # Цепочка закончена - отправляем результат через вебхук
+                # Переопределяем next_message как результат для воркера
+                next_message = ResultMessage(
+                    message_id=task_message.message_id,
+                    message_type=MessageType.RESULT,
+                    source_service=self.service_name,
+                    target_services=None,  # цепочка завершена
+                    original_message_id=task_message.message_id,
+                    data=ResultData(success = result_data.success)
+                )
+                
                 await self._send_webhook(callback_url, next_message)
+            else:
+                await self._send_webhook(callback_url, next_message)
+
             
             processing_time = (time.time() - self.processing_start_time) * 1000
             print(f"✅ {self.service_name} background task completed in {processing_time:.2f}ms", file=sys.stderr)
@@ -341,7 +417,7 @@ class BaseService:
             self.current_task_id = None
             self.processing_start_time = None
     
-    async def _send_task_to_next_service(self, task_message: TaskMessage):
+    async def _send_task_to_next_service(self, task_message: TaskMessage) -> bool:
         """
         ОТПРАВЛЯЕТ ЗАДАЧУ СЛЕДУЮЩЕМУ СЕРВИСУ В ЦЕПОЧКЕ ЧЕРЕЗ RABBITMQ
         """
@@ -355,15 +431,25 @@ class BaseService:
             
             next_service = task_message.target_services[0]
             print(f"📤 {self.service_name} publishing task to RabbitMQ for: {next_service}", file=sys.stderr)
+
+            # ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ ДЛЯ ДЕБАГА
+            print(f"   Publisher type: {type(publisher)}", file=sys.stderr)
+            print(f"   Task message type: {type(task_message)}", file=sys.stderr)
+            print(f"   Task message ID: {task_message.message_id}", file=sys.stderr)
             
-            # Используем publish_task без routing_key - будет использована дефолтная очередь
-            await publisher.publish_task(task_message)
+            # Пробуем отправить с явным указанием routing_key
+            routing_key = os.getenv("QUEUE_NAME", "tasks")
+            print(f"   Using routing key: {routing_key}", file=sys.stderr)
+            
+            await publisher.publish_task(task_message, routing_key=routing_key)
             
             print(f"✅ {self.service_name} task published to RabbitMQ for {next_service}", file=sys.stderr)
             return True
                 
         except Exception as e:
             print(f"❌ {self.service_name} failed to publish task to RabbitMQ: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
             return False
 
     # Остальные методы остаются без изменений:

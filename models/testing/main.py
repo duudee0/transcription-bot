@@ -5,7 +5,7 @@ import asyncio
 from typing import Dict, Any
 
 # ТЕСТОВАЯ ЗАДЕРЖКА УКАЗЫВАТЬ
-TESTING_SLEEP = 20
+TESTING_SLEEP = 22
 
 class LLMService(BaseService):
     """LLM Service с тестовой реализацией"""
