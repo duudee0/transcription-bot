@@ -2,13 +2,17 @@
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional, Any, Dict, List
+from aio_pika import connect_robust
 import uvicorn
 import time
+import os
 import sys
 import asyncio
 import httpx
 from uuid import UUID
 
+
+from common.publisher import Publisher
 # Импортируем общие модели
 from common.models import TaskMessage, ResultMessage, ResultData, MessageType, TaskData
 
@@ -31,6 +35,9 @@ class BaseService:
         
         # Регистрируем стандартные эндпоинты
         self._register_common_endpoints()
+
+        # Отправка в rabbitmq
+        self.publisher = Publisher
     
     def _register_common_endpoints(self):
         """Регистрирует общие эндпоинты для всех сервисов"""
@@ -55,6 +62,32 @@ class BaseService:
         async def process_task_endpoint(request: Request, background_tasks: BackgroundTasks):
             return await self._process_task_handler(request, background_tasks)
     
+    async def ensure_publisher(self) -> Publisher:
+        """Обеспечивает наличие publisher (создает при необходимости)"""
+        if self.publisher is None:
+            print(f"🔄 Creating RabbitMQ connection for {self.service_name}", file=sys.stderr)
+            rabbit_url = os.getenv("RABBIT_URL", "amqp://guest:guest@rabbitmq:5672/")
+            connection = await connect_robust(rabbit_url)
+            self.publisher = Publisher(connection, prefetch=5, declare_queues=True)
+        
+        return self.publisher
+
+    def run(self, host: str = "0.0.0.0", port: int = 8000):
+        """Синхронный запуск сервиса (совместимость с вашим текущим кодом)"""
+        # Запускаем асинхронную инициализацию в синхронном контексте
+        asyncio.run(self._run_with_publisher(host, port))
+    
+    async def _run_with_publisher(self, host: str, port: int):
+        """Асинхронная подготовка и запуск"""
+        # Убеждаемся, что publisher создан
+        await self.ensure_publisher()
+        print(f"✅ {self.service_name} publisher initialized", file=sys.stderr)
+        
+        # Запускаем uvicorn синхронно для совместимости
+        config = uvicorn.Config(self.app, host=host, port=port)
+        server = uvicorn.Server(config)
+        await server.serve()
+
     def _should_process_message(self, task_message: TaskMessage) -> bool:
         """
         ОПРЕДЕЛЯЕТ, ДОЛЖЕН ЛИ СЕРВИС ОБРАБОТАТЬ СООБЩЕНИЕ
@@ -310,34 +343,27 @@ class BaseService:
     
     async def _send_task_to_next_service(self, task_message: TaskMessage):
         """
-        ОТПРАВЛЯЕТ ЗАДАЧУ СЛЕДУЮЩЕМУ СЕРВИСУ В ЦЕПОЧКЕ
+        ОТПРАВЛЯЕТ ЗАДАЧУ СЛЕДУЮЩЕМУ СЕРВИСУ В ЦЕПОЧКЕ ЧЕРЕЗ RABBITMQ
         """
         if not task_message.target_services:
             print("⚠️ No target services for next task", file=sys.stderr)
-            return
-        
-        next_service = task_message.target_services[0]
-        service_url = f"http://{next_service}:8000/api/v1/process"
+            return False
         
         try:
-            print(f"📤 {self.service_name} sending task to: {next_service} at {service_url}", file=sys.stderr)
+            # Обеспечиваем наличие publisher
+            publisher = await self.ensure_publisher()
             
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    service_url,
-                    json=task_message.model_dump(mode='json'),
-                    headers={"Content-Type": "application/json"}
-                )
+            next_service = task_message.target_services[0]
+            print(f"📤 {self.service_name} publishing task to RabbitMQ for: {next_service}", file=sys.stderr)
+            
+            # Используем publish_task без routing_key - будет использована дефолтная очередь
+            await publisher.publish_task(task_message)
+            
+            print(f"✅ {self.service_name} task published to RabbitMQ for {next_service}", file=sys.stderr)
+            return True
                 
-                if response.status_code == 200:
-                    print(f"✅ {self.service_name} task delivered to {next_service}", file=sys.stderr)
-                    return True
-                else:
-                    print(f"⚠️ {self.service_name} task delivery failed: {response.status_code}", file=sys.stderr)
-                    return False
-                    
         except Exception as e:
-            print(f"❌ {self.service_name} task sending failed: {e}", file=sys.stderr)
+            print(f"❌ {self.service_name} failed to publish task to RabbitMQ: {e}", file=sys.stderr)
             return False
 
     # Остальные методы остаются без изменений:

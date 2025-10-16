@@ -5,6 +5,7 @@ ENV PYTHONUNBUFFERED=1
 
 # Копируем общие модели
 COPY common/models.py /app/common/models.py
+COPY common/publisher.py /app/common/publisher.py
 
 COPY models/common /app/common
 

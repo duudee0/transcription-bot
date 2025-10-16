@@ -45,6 +45,7 @@ services:
       - GIGACHAT_VERIFY_SSL=False
     ports:
       - "8001:8000"   # Different port to avoid conflict
+    command: sh -c "sleep 7 && exec python main.py"
     networks:
       - internal
 
@@ -65,6 +66,7 @@ services:
     #   interval: 5s
     #   timeout: 3s
     #   retries: 5
+    command: sh -c "sleep 7 && exec python main.py"
     networks:
       - internal
 

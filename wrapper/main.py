@@ -12,7 +12,7 @@ from datetime import datetime
 import logging
 
 from common.models import TaskMessage, ResultMessage, ResultData, TaskData, MessageType
-from common.publisher import Publisher  # ваш существующий publisher
+from common.publisher import Publisher
 
 
 RABBIT_URL = os.getenv("RABBIT_URL", "amqp://guest:guest@rabbitmq:5672/")
