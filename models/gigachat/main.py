@@ -18,7 +18,27 @@ class GigaChatService(BaseService):
         self.gigachat_token = os.getenv("GIGACHAT_TOKEN")
         self.gigachat_model = os.getenv("GIGACHAT_MODEL", "GigaChat")
         self.gigachat_verify_ssl = os.getenv("GIGACHAT_VERIFY_SSL", "True").lower() == "true"
+
+    def _can_handle_task_type(self, task_type: str) -> bool:
+        """
+        ОПРЕДЕЛЯЕТ, МОЖЕТ ЛИСЕРВИС ОБРАБОТАТЬ ТИП ЗАДАЧИ
+        
+        Этот метод НУЖНО ДОБАВИТЬ - он теперь обязателен в BaseService
+        """
+        supported_task_types = [
+            "generate_response", 
+        ]
+        return task_type in supported_task_types
     
+    async def _validate_task(self, task_message: TaskMessage):
+        """Валидация задачи для сервиса"""
+        # Теперь используем _can_handle_task_type для валидации
+        if not self._can_handle_task_type(task_message.data.task_type):
+            raise HTTPException(
+                status_code=400,
+                detail=f"LLM service does not support task type: {task_message.data.task_type}"
+            )
+
     async def _health_handler(self):
         """Переопределяем health handler для проверки токена"""
         status = "ok" if self.gigachat_token else "no_token"

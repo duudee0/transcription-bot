@@ -13,10 +13,28 @@ class LLMService(BaseService):
     def __init__(self):
         super().__init__("llm-service", "0.3")
     
+    def _can_handle_task_type(self, task_type: str) -> bool:
+        """
+        ОПРЕДЕЛЯЕТ, МОЖЕТ ЛИ LLM СЕРВИС ОБРАБОТАТЬ ТИП ЗАДАЧИ
+        
+        Этот метод НУЖНО ДОБАВИТЬ - он теперь обязателен в BaseService
+        """
+        supported_task_types = [
+            "analyze_text", 
+            "generate_response",
+            "process_text",
+            "chat_completion"
+        ]
+        return task_type in supported_task_types
+    
     async def _validate_task(self, task_message: TaskMessage):
         """Валидация задачи для LLM сервиса"""
-        # LLM сервис поддерживает все типы задач для тестирования
-        pass
+        # Теперь используем _can_handle_task_type для валидации
+        if not self._can_handle_task_type(task_message.data.task_type):
+            raise HTTPException(
+                status_code=400,
+                detail=f"LLM service does not support task type: {task_message.data.task_type}"
+            )
     
     async def _process_task_logic(self, task_message: TaskMessage) -> ResultData:
         """Логика обработки задачи для LLM сервиса"""

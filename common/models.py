@@ -1,8 +1,10 @@
-from pydantic import BaseModel, Field
-from uuid import uuid4, UUID
-from datetime import datetime
-from typing import Any, Dict, Optional
+from pydantic import Field, model_validator, BaseModel
+from pydantic.generics import GenericModel
+from typing import TypeVar, Generic, Optional, List, Dict, Any, Type
+from uuid import UUID, uuid4
+from datetime import datetime, timezone
 from enum import Enum
+import json
 
 """
 МОДЕЛИ ДАННЫХ ДЛЯ МИКРОСЕРВИСНОЙ АРХИТЕКТУРЫ
@@ -16,6 +18,9 @@ from enum import Enum
 - Система использует JSON-сериализацию для обмена сообщениями
 """
 
+
+T = TypeVar("T")
+
 class MessageType(str, Enum):
     """
     Типы сообщений в системе.
@@ -28,7 +33,7 @@ class MessageType(str, Enum):
     STATUS = "status"      # Статус сервиса (health check, мониторинг)
 
 
-class BaseMessage(BaseModel):
+class BaseMessage(GenericModel, Generic[T]):
     """
     БАЗОВАЯ МОДЕЛЬ СООБЩЕНИЯ
     
@@ -44,14 +49,19 @@ class BaseMessage(BaseModel):
     # Сервис-отправитель сообщения
     source_service: str
     
+    # Сервисы-получатели (опционально, для прямой маршрутизации)
+    target_services: Optional[List[str]] = None 
     # Сервис-получатель (опционально, для прямой маршрутизации)
-    target_service: Optional[str] = None
+    #target_service: Optional[str] = None
+
     
     # Время создания сообщения (генерируется автоматически)
-    timestamp: datetime = Field(default_factory=datetime.now)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     
     # Версия формата сообщения (для обратной совместимости)
-    version: str = "1.0"
+    version: str = "2.0"
+
+    data: T
 
 
 class TaskData(BaseModel):
@@ -70,7 +80,7 @@ class TaskData(BaseModel):
     parameters: Dict[str, Any] = Field(default_factory=dict)  # Пример: {"quality": "high", "timeout": 30}
 
 
-class TaskMessage(BaseMessage):
+class TaskMessage(BaseMessage[TaskData]):
     """
     СООБЩЕНИЕ-ЗАДАЧА
     
@@ -103,12 +113,13 @@ class ResultData(BaseModel):
     execution_metadata: Dict[str, Any] = Field(default_factory=dict)  # Пример: {"processing_time_ms": 150, "memory_used_mb": 128}
 
 
-class ResultMessage(BaseMessage):
+class ResultMessage(BaseMessage[ResultData]):
     """
     СООБЩЕНИЕ-РЕЗУЛЬТАТ
     
     Отправляется в ответ на TaskMessage после выполнения работы.
     Содержит результат обработки или информацию об ошибке.
+    always message_type == MessageType.RESULT
     """
     # Всегда имеет тип RESULT (переопределяем базовое поле)
     message_type: MessageType = MessageType.RESULT
@@ -118,6 +129,29 @@ class ResultMessage(BaseMessage):
     
     # Данные результата выполнения
     data: ResultData
+
+# Mapping for parse helper
+MSG_MAP: Dict[str, Type[BaseMessage]] = {
+    MessageType.TASK.value: TaskMessage,
+    MessageType.RESULT.value: ResultMessage,
+    # extend if you add ERROR/STATUS message types
+}
+
+
+def parse_message(json_str: str) -> BaseMessage:
+    """
+    Parse raw JSON string and return a proper BaseMessage subclass instance.
+    (No backward compatibility behavior here — expects new schema).
+    """
+    raw = json.loads(json_str)
+    mtype = raw.get("message_type")
+    if not mtype:
+        raise ValueError("missing message_type")
+    cls = MSG_MAP.get(mtype)
+    if not cls:
+        raise ValueError(f"unknown message_type={mtype}")
+    # Pydantic v2: model_validate_json works on GenericModel subclasses
+    return cls.model_validate_json(json_str)
 
 
 """
@@ -157,7 +191,7 @@ restored_task = TaskMessage.model_validate_json(json_string)
   "message_id": "123e4567-e89b-12d3-a456-426614174001",
   "message_type": "task", 
   "source_service": "test-client",
-  "target_service": "llm-service",
+  "target_services": ["llm-service"],
   "timestamp": "2024-01-15T10:35:00.000Z",
   "version": "1.0",
   "data": {
@@ -177,7 +211,7 @@ restored_task = TaskMessage.model_validate_json(json_string)
   "message_id": "123e4567-e89b-12d3-a456-426614174002",
   "message_type": "task",
   "source_service": "test-client", 
-  "target_service": "image-service",
+  "target_services": ["image-service"],
   "timestamp": "2024-01-15T10:40:00.000Z",
   "version": "1.0",
   "data": {
@@ -200,6 +234,7 @@ Gigachat:
   "message_id": "123e4567-e89b-12d3-a456-426614174002",
   "message_type": "task",
   "source_service": "test-client", 
+  "target_services": ["gigachat-service"],
   "timestamp": "2024-01-15T10:40:00.000Z",
   "version": "1.0",
     "data": {

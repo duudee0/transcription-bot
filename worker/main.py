@@ -10,7 +10,7 @@ import sys
 import time
 import functools
 import httpx
-from typing import Optional, Dict, Any, Set
+from typing import Optional, Dict, Any, Set, List
 from aio_pika import connect_robust, Message, IncomingMessage, DeliveryMode
 from uuid import uuid4
 # FastAPI и uvicorn для вебхуков 
@@ -115,14 +115,16 @@ async def check_service_ready(service_config: dict) -> bool:
         logger.error(f"   💥 Service {service_name} unreachable: {e}")
         return None
 
-def get_service_config(task_type: str, target_service: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Определяет какой сервис должен обрабатывать задачу с детальным логированием"""
-
-    logger.info(f"🔍 Looking up service config for task_type='{task_type}', target_service='{target_service}'")
+def get_service_config(task_type: str, target_services: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+    """Определяет какой сервис должен обрабатывать задачу с поддержкой цепочек"""
     
-    # Если явно указан целевой сервис
-    if target_service:
-        logger.info(f"🎯 Explicit target_service specified: {target_service}")
+    logger.info(f"🔍 Looking up service config for task_type='{task_type}', target_services='{target_services}'")
+    
+    # Если указана цепочка сервисов, берем первый из target_services
+    if target_services and len(target_services) > 0:
+        target_service = target_services[0]
+        logger.info(f"🎯 Using first from target_services: {target_service}")
+        
         for task_key, config in SERVICE_CONFIGS.items():
             if config["service_name"] == target_service:
                 logger.info(f"✅ Found service config: {config['service_name']} for task type: {task_key}")
@@ -131,19 +133,19 @@ def get_service_config(task_type: str, target_service: Optional[str] = None) -> 
         logger.warning(f"❌ Target service '{target_service}' not found in SERVICE_CONFIGS")
         return None
     
-    # Определяем по типу задачи
+    # Старая логика (если нет цепочки) - определяем по типу задачи
     if task_type in SERVICE_CONFIGS:
         config = SERVICE_CONFIGS[task_type]
         logger.info(f"✅ Found direct mapping: task_type='{task_type}' -> service='{config['service_name']}'")
         return config
     
-    # Ищем подходящий сервис по паттерну (например, "process_*" -> "image-service")
+    # Ищем подходящий сервис по паттерну
     for task_pattern, config in SERVICE_CONFIGS.items():
-        if task_type.startswith(task_pattern.split('_')[0] + '_'):  # простой паттерн
+        if task_type.startswith(task_pattern.split('_')[0] + '_'):
             logger.info(f"🔀 Pattern match: task_type='{task_type}' matches pattern '{task_pattern}' -> service='{config['service_name']}'")
             return config
     
-    logger.error(f"🚨 No service config found for task_type='{task_type}' and no fallback available")
+    logger.error(f"🚨 No service config found for task_type='{task_type}'")
     logger.info(f"📋 Available task types: {list(SERVICE_CONFIGS.keys())}")
     return None
 
@@ -201,7 +203,7 @@ async def process_task(task: TaskMessage, msg: IncomingMessage) -> Optional[Resu
         # Определяем конфиг сервиса
         service_config = get_service_config(
             task.data.task_type,
-            task.target_service
+            task.target_services 
         )
         
         if not service_config:
@@ -209,7 +211,7 @@ async def process_task(task: TaskMessage, msg: IncomingMessage) -> Optional[Resu
             logger.error(f"❌ {error_msg}")
             return ResultMessage(
                 source_service=WORKER_NAME,
-                target_service=task.source_service,
+                target_services=[task.source_service],
                 original_message_id=task.message_id,
                 data=ResultData(
                     success=False,
@@ -225,24 +227,28 @@ async def process_task(task: TaskMessage, msg: IncomingMessage) -> Optional[Resu
         
         logger.info(f"🎯 Target: {service_name} at {target_url}")
         
-        # Пытаемся использовать вебхук для долгих задач
-        # Добавляем callback_url для вебхука
-        callback_url = f"http://{WORKER_HOST}:{WORKER_PORT}/webhook/{task.message_id}"
-        
-        # Создаем копию задачи с callback_url
+        # Подготавливаем данные для следующего сервиса в цепочке (НОВАЯ ЛОГИКА)
+        remaining_services = task.target_services[1:] if task.target_services else []
+
+        # Если есть следующие сервисы, готовим данные для цепочки
         enhanced_input_data = {
             **task.data.input_data,
-            "callback_url": callback_url,
+            "callback_url": f"http://{WORKER_HOST}:{WORKER_PORT}/webhook/{task.message_id}",
             "webhook_supported": True
         }
         
+        # Если есть цепочка, передаем оставшиеся сервисы
+        enhanced_task_data = {
+            **task.data.model_dump(),
+            "input_data": enhanced_input_data
+        }
+        
+        # Создаем enhanced task с обновленными target_services если есть цепочка
         enhanced_task = TaskMessage(
             **{
                 **task.model_dump(),
-                "data": {
-                    **task.data.model_dump(),
-                    "input_data": enhanced_input_data
-                }
+                "data": enhanced_task_data,
+                "target_services": [service_name] + remaining_services if remaining_services else None
             }
         )
         
@@ -253,7 +259,7 @@ async def process_task(task: TaskMessage, msg: IncomingMessage) -> Optional[Resu
             logger.error(f"❌ HTTP request failed to {service_name}: {service_result['error']}")
             return ResultMessage(
                 source_service=WORKER_NAME,
-                target_service=task.source_service,
+                target_services=[task.source_service],
                 original_message_id=task.message_id,
                 data=ResultData(
                     success=False,
@@ -294,7 +300,7 @@ async def process_task(task: TaskMessage, msg: IncomingMessage) -> Optional[Resu
         logger.error(f"💥 Unexpected error in process_task: {e}", exc_info=True)
         return ResultMessage(
             source_service=WORKER_NAME,
-            target_service=task.source_service if task else "unknown",
+            target_services=[task.source_service] if task else ["unknown"],
             original_message_id=task.message_id if task else uuid4(),
             data=ResultData(
                 success=False,
@@ -316,7 +322,7 @@ async def handle_message(msg: IncomingMessage, publisher: Publisher):
         # Определяем целевой сервис
         service_config = get_service_config(
             task_message.data.task_type,
-            task_message.target_service
+            task_message.target_services
         )
         
         if not service_config:
@@ -346,7 +352,7 @@ async def handle_message(msg: IncomingMessage, publisher: Publisher):
 
                 result_message = ResultMessage(
                     source_service=WORKER_NAME,
-                    target_service=task_message.source_service,
+                    target_services=[task_message.source_service],
                     original_message_id=task_message.message_id,
                     data=ResultData(
                         success=False,
