@@ -21,20 +21,19 @@ class LLMService(BaseService):
         """
         supported_task_types = [
             "analyze_text", 
-            "generate_response",
-            "process_text",
-            "chat_completion"
+            "promt_response",
         ]
         return task_type in supported_task_types
     
     async def _validate_task(self, task_message: TaskMessage):
         """Валидация задачи для LLM сервиса"""
         # Теперь используем _can_handle_task_type для валидации
-        if not self._can_handle_task_type(task_message.data.task_type):
-            raise HTTPException(
-                status_code=400,
-                detail=f"LLM service does not support task type: {task_message.data.task_type}"
-            )
+        # if not self._can_handle_task_type(task_message.data.task_type):
+        #     raise HTTPException(
+        #         status_code=400,
+        #         detail=f"LLM service does not support task type: {task_message.data.task_type}"
+        #     )
+        pass
     
     async def _process_task_logic(self, task_message: TaskMessage) -> ResultData:
         """Логика обработки задачи для LLM сервиса"""
@@ -71,9 +70,12 @@ class LLMService(BaseService):
         
         words = text.split()
         
+        promt = f"{text} \nin this is text word:{len(words)}"
+
         return {
             "task": "text_analysis",
             "word_count": len(words),
+            "promt": promt,
             "language": language,
             "estimated_reading_time_sec": max(1, len(words) // 3),
             "contains_questions": "?" in text,

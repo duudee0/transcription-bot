@@ -22,6 +22,14 @@ WRAPPER_PORT = int(os.getenv("WRAPPER_PORT", "8003"))
 # Глобальный publisher
 publisher = None
 
+# Задачи, которые должны проходить через несколько сервисов (последовательно)
+MULTI_SERVICE_CHAINS = {
+    "comprehensive_analysis": ["llm-service", "gigachat-service"],
+    "text_to_speech": ["llm-service", "voice-service"], 
+    "content_creation": ["gigachat-service", "image-service"],
+    "full_processing": ["llm-service", "gigachat-service", "image-service"]
+}
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -107,11 +115,17 @@ async def create_task(
     
     # Определяем целевые сервисы
     target_services = task_request.service_chain
+    
     if not target_services:
-        # Автоматическое определение по task_type
-        service_config = SERVICE_CONFIGS.get(task_request.task_type)
-        if service_config:
-            target_services = [service_config["service_name"]]
+        # ПРОВЕРЯЕМ МНОГОСЕРВИСНЫЕ ЦЕПОЧКИ
+        if task_request.task_type in MULTI_SERVICE_CHAINS:
+            target_services = MULTI_SERVICE_CHAINS[task_request.task_type]
+            logger.info(f"🔗 Multi-service chain: {task_request.task_type} -> {target_services}")
+        else:
+            # Старая логика для одиночных задач
+            service_config = SERVICE_CONFIGS.get(task_request.task_type)
+            if service_config:
+                target_services = [service_config["service_name"]]
     
     # TODO: ПРОДАКШЕН НУЖНО ФИКСИТЬ
     # Подготавливаем input_data с callback_url для wrapper'а

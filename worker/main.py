@@ -126,7 +126,7 @@ def get_service_config(task_type: str, target_services: Optional[List[str]] = No
     """Определяет какой сервис должен обрабатывать задачу с поддержкой цепочек"""
     
     logger.info(f"🔍 Looking up service config for task_type='{task_type}', target_services='{target_services}'")
-    
+
     # Если указана цепочка сервисов, берем первый из target_services
     if target_services and len(target_services) > 0:
         target_service = target_services[0]
@@ -141,16 +141,16 @@ def get_service_config(task_type: str, target_services: Optional[List[str]] = No
         return None
     
     # Старая логика (если нет цепочки) - определяем по типу задачи
-    if task_type in SERVICE_CONFIGS:
-        config = SERVICE_CONFIGS[task_type]
-        logger.info(f"✅ Found direct mapping: task_type='{task_type}' -> service='{config['service_name']}'")
-        return config
+    # if task_type in SERVICE_CONFIGS:
+    #     config = SERVICE_CONFIGS[task_type]
+    #     logger.info(f"✅ Found direct mapping: task_type='{task_type}' -> service='{config['service_name']}'")
+    #     return config
     
-    # Ищем подходящий сервис по паттерну
-    for task_pattern, config in SERVICE_CONFIGS.items():
-        if task_type.startswith(task_pattern.split('_')[0] + '_'):
-            logger.info(f"🔀 Pattern match: task_type='{task_type}' matches pattern '{task_pattern}' -> service='{config['service_name']}'")
-            return config
+    # # Ищем подходящий сервис по паттерну
+    # for task_pattern, config in SERVICE_CONFIGS.items():
+    #     if task_type.startswith(task_pattern.split('_')[0] + '_'):
+    #         logger.info(f"🔀 Pattern match: task_type='{task_type}' matches pattern '{task_pattern}' -> service='{config['service_name']}'")
+    #         return config
     
     logger.error(f"🚨 No service config found for task_type='{task_type}'")
     logger.info(f"📋 Available task types: {list(SERVICE_CONFIGS.keys())}")
@@ -202,31 +202,11 @@ async def send_via_http(url: str, payload: dict) -> dict:
 
 
 
-async def process_task(task: TaskMessage, msg: IncomingMessage) -> Optional[ResultMessage]:
+async def process_task(task: TaskMessage, msg: IncomingMessage, service_config: Dict[str, Any]) -> Optional[ResultMessage]:
     """Логика обработки задачи с гарантированным возвратом"""
     logger.info(f"🔄 Starting task processing: {task.message_id}")
     
     try:
-        # Определяем конфиг сервиса
-        service_config = get_service_config(
-            task.data.task_type,
-            task.target_services 
-        )
-        
-        if not service_config:
-            error_msg = f"No service configuration found for task type '{task.data.task_type}'"
-            logger.error(f"❌ {error_msg}")
-            return ResultMessage(
-                source_service=WORKER_NAME,
-                target_services=[task.source_service],
-                original_message_id=task.message_id,
-                data=ResultData(
-                    success=False,
-                    error_message=error_msg,
-                    execution_metadata={"worker": WORKER_NAME, "error": True}
-                )
-            )
-        
         service_name = service_config["service_name"]
         base_url = service_config["base_url"]
         endpoint = service_config.get("endpoint", "/api/v1/process")
@@ -241,7 +221,6 @@ async def process_task(task: TaskMessage, msg: IncomingMessage) -> Optional[Resu
         enhanced_input_data = {
             **task.data.input_data,
             "callback_url": f"http://{WORKER_HOST}:{WORKER_PORT}/webhook/{task.message_id}",
-            "webhook_supported": True
         }
         
         # Если есть цепочка, передаем оставшиеся сервисы
@@ -402,7 +381,7 @@ async def handle_message(msg: IncomingMessage, publisher: Publisher):
             return
         
         # Обрабатываем задачу
-        result_message = await process_task(task_message, msg)
+        result_message = await process_task(task_message, msg, service_config)
         
         # Подтверждаем сообщение
         #await msg.ack()

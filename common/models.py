@@ -71,7 +71,7 @@ class TaskData(BaseModel):
     Содержит информацию о задаче, которую нужно выполнить.
     """
     # Тип задачи (определяет, какой воркер должен её обработать)
-    task_type: str  # Примеры: "process_image", "analyze_text", "generate_report"
+    task_type: Optional[str] = None  # Примеры: "process_image", "analyze_text", "generate_report"
     
     # Входные данные для задачи (произвольный словарь)
     input_data: Dict[str, Any]  # Пример: {"image_url": "http://...", "text": "Hello"}
@@ -130,37 +130,14 @@ class ResultMessage(BaseMessage[ResultData]):
     # Данные результата выполнения
     data: ResultData
 
-# Mapping for parse helper
-MSG_MAP: Dict[str, Type[BaseMessage]] = {
-    MessageType.TASK.value: TaskMessage,
-    MessageType.RESULT.value: ResultMessage,
-    # extend if you add ERROR/STATUS message types
-}
-
-
-def parse_message(json_str: str) -> BaseMessage:
-    """
-    Parse raw JSON string and return a proper BaseMessage subclass instance.
-    (No backward compatibility behavior here — expects new schema).
-    """
-    raw = json.loads(json_str)
-    mtype = raw.get("message_type")
-    if not mtype:
-        raise ValueError("missing message_type")
-    cls = MSG_MAP.get(mtype)
-    if not cls:
-        raise ValueError(f"unknown message_type={mtype}")
-    # Pydantic v2: model_validate_json works on GenericModel subclasses
-    return cls.model_validate_json(json_str)
-
 
 """
 ПРИМЕРЫ ИСПОЛЬЗОВАНИЯ:
 
 1. СОЗДАНИЕ ЗАДАЧИ:
 task = TaskMessage(
-    source_service="web-api",
-    target_service="image-processor",
+    source_service= "web-api",
+    target_services=["image-processor"],
     data=TaskData(
         task_type="process_image",
         input_data={"image_url": "https://example.com/photo.jpg"},
@@ -171,7 +148,7 @@ task = TaskMessage(
 2. СОЗДАНИЕ РЕЗУЛЬТАТА:
 result = ResultMessage(
     source_service="image-processor",
-    target_service="web-api",
+    target_services=["web-api"],
     original_message_id=task.message_id,
     data=ResultData(
         success=True,

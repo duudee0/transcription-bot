@@ -18,3 +18,5 @@ venv.bak/
 *.tmp
 *.temp
 rabbitmq/
+
+udo pkill -9 containerd

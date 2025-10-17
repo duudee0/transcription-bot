@@ -33,12 +33,14 @@ class GigaChatService(BaseService):
     async def _validate_task(self, task_message: TaskMessage):
         """Валидация задачи для сервиса"""
         # Теперь используем _can_handle_task_type для валидации
-        if not self._can_handle_task_type(task_message.data.task_type):
-            raise HTTPException(
-                status_code=400,
-                detail=f"LLM service does not support task type: {task_message.data.task_type}"
-            )
+        # if not self._can_handle_task_type(task_message.data.task_type):
+        #     raise HTTPException(
+        #         status_code=400,
+        #         detail=f"LLM service does not support task type: {task_message.data.task_type}"
+        #     )
+        pass
 
+    #TODO воркер не видел если не было токена надо исправить
     async def _health_handler(self):
         """Переопределяем health handler для проверки токена"""
         status = "ok" if self.gigachat_token else "no_token"
@@ -56,17 +58,18 @@ class GigaChatService(BaseService):
             raise HTTPException(status_code=500, detail="GIGACHAT_TOKEN not configured")
         
         # Проверяем тип задачи
-        if task_message.data.task_type != "generate_response":
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Unsupported task type: {task_message.data.task_type}. Only 'generate_response' is supported"
-            )
+        # if task_message.data.task_type != "generate_response":
+        #     raise HTTPException(
+        #         status_code=400, 
+        #         detail=f"Unsupported task type: {task_message.data.task_type}. Only 'generate_response' is supported"
+        #     )
         
         # Проверяем наличие промпта
         prompt = task_message.data.input_data.get("prompt", "")
         if not prompt:
-            raise ValueError("Prompt is required for generate_response task")
-    
+            raise ValueError(f"Prompt is required for generate_response task\n Data: {task_message.data.input_data}")
+    # TODO воркер не хочет нормально обрабатывать ошибки
+
     async def _process_task_logic(self, task_message: TaskMessage) -> ResultData:
         """Логика обработки задачи через GigaChat"""
         prompt = task_message.data.input_data.get("prompt", "")

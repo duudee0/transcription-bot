@@ -120,8 +120,8 @@ class BaseService:
             return (task_message.target_services and 
                     task_message.target_services[0] == self.service_name)
         else:
-            # Если цепочки нет, проверяем по типу задачи
-            return self._can_handle_task_type(task_message.data.task_type)
+            # Если цепочки нет, проверяем по мы ли первые
+            return task_message.target_services[0] == self.service_name
     
     def _can_handle_task_type(self, task_type: str) -> bool:
         """
@@ -141,14 +141,6 @@ class BaseService:
             # Парсим входящий JSON и валидируем как TaskMessage
             body = await request.json()
             task_message = TaskMessage.model_validate(body)
-            
-            # Проверяем, должен ли этот сервис обрабатывать сообщение
-            if not self._should_process_message(task_message):
-                raise HTTPException(
-                    status_code=400, 
-                    detail=f"Service {self.service_name} should not process this message. "
-                          f"Expected: {task_message.target_services[0] if task_message.target_services else 'any service'}"
-                )
             
             # Сохраняем в историю
             self.processing_history[str(task_message.message_id)] = {
@@ -231,7 +223,6 @@ class BaseService:
         if remaining_services:
             # Есть следующие сервисы - передаем задачу дальше через RabbitMQ
             next_service = remaining_services[0]
-            next_task_type = self._get_task_type_for_service(next_service)
             
             new_message_id = uuid4()
             print(f"🔄 Chain: {self.service_name} -> {next_service}", file=sys.stderr)
@@ -243,7 +234,7 @@ class BaseService:
                 source_service=self.service_name,
                 target_services=remaining_services,
                 data=TaskData(
-                    task_type=next_task_type,
+                    task_type=task_message.data.task_type,                    
                     input_data=task_message.data.input_data,  # передаем все input_data (включая callback_url)
                     parameters=task_message.data.parameters
                 )
@@ -287,7 +278,7 @@ class BaseService:
                 source_service=self.service_name,
                 target_services=None,
                 original_message_id=task_message.message_id,
-                data=ResultData(success = result_data.success)
+                data=result_data
             )
             
             # Отправляем вебхук в wrapper
@@ -298,6 +289,8 @@ class BaseService:
             else:
                 print(f"⚠️ No wrapper_callback_url for final result", file=sys.stderr)
             
+            # Скорем результат от worker'a
+            final_result.data=ResultData(success = result_data.success)
             return final_result
         
     async def _send_webhook_to_wrapper(self, wrapper_url: str, result_message: ResultMessage):
@@ -333,25 +326,6 @@ class BaseService:
         # Удаляем текущий сервис из цепочки
         remaining = task_message.target_services[1:]
         return remaining
-    
-    def _get_task_type_for_service(self, service_name: str) -> str:
-        """
-        ОПРЕДЕЛЯЕТ ТИП ЗАДАЧИ ДЛЯ СЛЕДУЮЩЕГО СЕРВИСА
-        
-        Дочерние классы могут переопределить эту логику
-        По умолчанию: используем mapping или имя сервиса как тип задачи
-        """
-        # Пример mapping'а - можно вынести в конфиг
-        service_task_mapping = {
-            "text-analyzer": "analyze_text",
-            "voice-synthesizer": "synthesize_voice", 
-            "animation-generator": "generate_animation",
-            "llm-service": "generate_response",
-            "gigachat-service": "generate_response",
-            "image-service": "process_image"
-        }
-        
-        return service_task_mapping.get(service_name, "process_data")
     
     async def _process_with_webhook_and_chain(self, task_message: TaskMessage, callback_url: str):
         """
