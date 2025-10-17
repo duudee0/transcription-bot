@@ -67,7 +67,7 @@ class GigaChatService(BaseService):
         # Проверяем наличие промпта
         prompt = task_message.data.input_data.get("prompt", "")
         if not prompt:
-            raise ValueError(f"Prompt is required for generate_response task\n Data: {task_message.data.input_data}")
+            raise HTTPException(status_code=500, detail=f"Prompt is required for generate_response task")
     # TODO воркер не хочет нормально обрабатывать ошибки
 
     async def _process_task_logic(self, task_message: TaskMessage) -> ResultData:

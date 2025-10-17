@@ -5,7 +5,7 @@ import asyncio
 from typing import Dict, Any
 
 # ТЕСТОВАЯ ЗАДЕРЖКА УКАЗЫВАТЬ
-TESTING_SLEEP = 22
+TESTING_SLEEP = 2
 
 class LLMService(BaseService):
     """LLM Service с тестовой реализацией"""
@@ -21,7 +21,7 @@ class LLMService(BaseService):
         """
         supported_task_types = [
             "analyze_text", 
-            "promt_response",
+            "prompt_response",
         ]
         return task_type in supported_task_types
     
@@ -47,11 +47,9 @@ class LLMService(BaseService):
         elif task_type == "generate_response":
             result = await self._generate_response(input_data)
         else:
-            result = {
-                "status": "unknown_task_type",
-                "received_data": input_data,
-                "note": "This task type is not implemented yet"
-            }
+            result = await self._analyze_text(input_data)
+        
+        print(f" 🙏 {result}")
         
         return ResultData(
             success=True,
@@ -70,12 +68,12 @@ class LLMService(BaseService):
         
         words = text.split()
         
-        promt = f"{text} \nin this is text word:{len(words)}"
+        prompt = f"{text} \nin this is text word:{len(words)}"
 
-        return {
+        return {  #TODO НЕ возвращаются данные почему то
             "task": "text_analysis",
             "word_count": len(words),
-            "promt": promt,
+            "prompt": prompt,
             "language": language,
             "estimated_reading_time_sec": max(1, len(words) // 3),
             "contains_questions": "?" in text,

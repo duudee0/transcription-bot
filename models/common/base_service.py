@@ -192,27 +192,35 @@ class BaseService:
                     }
                 )
             )
+        except HTTPException:
+            # Пробрасываем HTTPException дальше - они вернут правильный статус код
+            raise
             
         except Exception as e:
             processing_time = (time.time() - start_time) * 1000
             print(f"❌ {self.service_name} error: {e}", file=sys.stderr)
             
-            error_result = ResultMessage(
-                message_type=MessageType.RESULT,
-                source_service=self.service_name,
-                target_services=task_message.target_services if 'task_message' in locals() else None,
-                original_message_id=getattr(task_message, 'message_id', None),
-                data=ResultData(
-                    success=False,
-                    error_message=str(e),
-                    execution_metadata={
-                        "processing_time_ms": processing_time,
-                        "error": True,
-                        "service": self.service_name
-                    }
-                )
-            )
-            return error_result
+            # TODO: ВОРКЕР НОРМАЛЬНО НЕ РЕАГИРУЕТ НА ТАКОЙ ОТВЕТ А СЛЕДОВАЛО БЫ ЕГО НАУЧИТЬ
+            # error_result = ResultMessage(
+            #     message_type=MessageType.RESULT,
+            #     source_service=self.service_name,
+            #     target_services=task_message.target_services if 'task_message' in locals() else None,
+            #     original_message_id=getattr(task_message, 'message_id', None),
+            #     data=ResultData(
+            #         success=False,
+            #         error_message=str(e),
+            #         execution_metadata={
+            #             "processing_time_ms": processing_time,
+            #             "error": True,
+            #             "service": self.service_name
+            #         }
+            #     )
+            # )
+            # return error_result
+            raise HTTPException(
+                status_code=500,
+                detail=f"Internal server error: {str(e)}"
+            )       
     
     async def _handle_service_chain(self, task_message: TaskMessage, result_data: ResultData) -> ResultMessage:
         """
@@ -225,8 +233,20 @@ class BaseService:
             next_service = remaining_services[0]
             
             new_message_id = uuid4()
-            print(f"🔄 Chain: {self.service_name} -> {next_service}", file=sys.stderr)
+            print(f"🔄 ⚙️ Chain: {self.service_name} -> {next_service}", file=sys.stderr)
+
+        
+            # ОБЪЕДИНЯЕМ ДАННЫЕ ОТ НАЧАЛЬНОЙ ЗАДАЧИ + ТО ЧТО ОТДАЛ СЕРВИС
+            next_input_data = task_message.data.input_data.copy()  # Копируем исходные данные
             
+            if result_data.result:
+                next_input_data = {
+                    **task_message.data.input_data,  # Распаковываем исходные данные
+                    **result_data.result,            # Распаковываем результат текущего сервиса
+                }
+
+            print(f"☢️ task_message.data.input_data:  {str(next_input_data)} \n\n result_data: {str(result_data.result)}\n\n")
+
             # Создаем новую задачу для следующего сервиса
             next_task = TaskMessage(
                 message_id=new_message_id,
@@ -235,7 +255,7 @@ class BaseService:
                 target_services=remaining_services,
                 data=TaskData(
                     task_type=task_message.data.task_type,                    
-                    input_data=task_message.data.input_data,  # передаем все input_data (включая callback_url)
+                    input_data=next_input_data,
                     parameters=task_message.data.parameters
                 )
             )
@@ -352,6 +372,7 @@ class BaseService:
             # Если цепочка продолжается, отправляем задачу следующему сервису
             if isinstance(next_message, TaskMessage):
                 await self._send_task_to_next_service(next_message)
+
                 # Переопределяем next_message как результат для воркера
                 next_message = ResultMessage(
                     message_id=task_message.message_id,
@@ -361,7 +382,6 @@ class BaseService:
                     original_message_id=task_message.message_id,
                     data=ResultData(success = result_data.success)
                 )
-                
                 await self._send_webhook(callback_url, next_message)
             else:
                 await self._send_webhook(callback_url, next_message)
