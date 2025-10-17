@@ -20,6 +20,7 @@ import uvicorn
 # Общие модули
 from common.models import TaskMessage, ResultMessage, ResultData, MessageType
 from common.publisher import Publisher
+from common.service_config import get_service_url
 
 from task_manager import AsyncTaskManager, send_to_result_queue
 
@@ -39,21 +40,6 @@ WORKER_NAME = os.getenv("WORKER_NAME", "generic-worker")
 WORKER_HOST = os.getenv("WORKER_HOST", "worker")
 WORKER_PORT = int(os.getenv("WORKER_PORT", "8080"))
 
-# Конфигурация сервисов
-SERVICE_CONFIGS = {
-    "generate_response": {
-        "base_url": "http://gigachat-service:8000",
-        "service_name": "gigachat-service"
-    },
-    "analyze_text": {
-        "base_url": "http://llm-service:8000",
-        "service_name": "llm-service"
-    },
-    "process_image": {
-        "base_url": "http://image-service:8000", 
-        "service_name": "image-service"
-    },
-}
 
 # Настройка логирования
 logging.basicConfig(
@@ -122,39 +108,29 @@ async def check_service_ready(service_config: dict) -> bool:
         logger.error(f"   💥 Service {service_name} unreachable: {e}")
         return None
 
-def get_service_config(task_type: str, target_services: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
-    """Определяет какой сервис должен обрабатывать задачу с поддержкой цепочек"""
+def get_service_config(target_services: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+    """Определяет конфиг сервиса на основе target_services"""
     
-    logger.info(f"🔍 Looking up service config for task_type='{task_type}', target_services='{target_services}'")
-
-    # Если указана цепочка сервисов, берем первый из target_services
-    if target_services and len(target_services) > 0:
-        target_service = target_services[0]
-        logger.info(f"🎯 Using first from target_services: {target_service}")
-        
-        for task_key, config in SERVICE_CONFIGS.items():
-            if config["service_name"] == target_service:
-                logger.info(f"✅ Found service config: {config['service_name']} for task type: {task_key}")
-                return config
-        
-        logger.warning(f"❌ Target service '{target_service}' not found in SERVICE_CONFIGS")
+    logger.info(f"🔍 Looking up service config for target_services='{target_services}'")
+    
+    if not target_services or len(target_services) == 0:
+        logger.error("❌ No target_services provided")
         return None
     
-    # Старая логика (если нет цепочки) - определяем по типу задачи
-    # if task_type in SERVICE_CONFIGS:
-    #     config = SERVICE_CONFIGS[task_type]
-    #     logger.info(f"✅ Found direct mapping: task_type='{task_type}' -> service='{config['service_name']}'")
-    #     return config
+    target_service = target_services[0]
+    logger.info(f"🎯 Using first from target_services: {target_service}")
     
-    # # Ищем подходящий сервис по паттерну
-    # for task_pattern, config in SERVICE_CONFIGS.items():
-    #     if task_type.startswith(task_pattern.split('_')[0] + '_'):
-    #         logger.info(f"🔀 Pattern match: task_type='{task_type}' matches pattern '{task_pattern}' -> service='{config['service_name']}'")
-    #         return config
+    base_url = get_service_url(target_service)
+    if not base_url:
+        logger.warning(f"❌ Target service '{target_service}' not found in SERVICE_REGISTRY")
+        return None
     
-    logger.error(f"🚨 No service config found for task_type='{task_type}'")
-    logger.info(f"📋 Available task types: {list(SERVICE_CONFIGS.keys())}")
-    return None
+    # Возвращаем простой конфиг
+    return {
+        "service_name": target_service,
+        "base_url": base_url,
+        "endpoint": "/api/v1/process"  # Стандартный endpoint
+    }
 
 async def send_via_http(url: str, payload: dict) -> dict:
     """Универсальная функция отправки HTTP запроса с улучшенным логированием"""
@@ -306,15 +282,25 @@ async def handle_message(msg: IncomingMessage, publisher: Publisher):
         logger.info(f"   From: {task_message.source_service}")
         
         # Определяем целевой сервис
-        service_config = get_service_config(
-            task_message.data.task_type,
-            task_message.target_services
-        )
-        
+        service_config = get_service_config(task_message.target_services)
+
         if not service_config:
             logger.error(f"❌ No service config found for task {task_message.message_id}")
+            error_msg = f"No service configuration found for target services: {task_message.target_services}"
+            logger.error(f"❌ {error_msg}")
+
             await msg.ack()
-            return
+            return ResultMessage(
+                source_service=WORKER_NAME,
+                target_services=[task_message.source_service],
+                original_message_id=task_message.message_id,
+                data=ResultData(
+                    success=False,
+                    error_message=error_msg,
+                    execution_metadata={"worker": WORKER_NAME, "error": True}
+                )
+            )
+
             
         service_name = service_config["service_name"]
         logger.info(f"🎯 Target service: {service_name}")
@@ -382,9 +368,13 @@ async def handle_message(msg: IncomingMessage, publisher: Publisher):
         
         # Обрабатываем задачу
         result_message = await process_task(task_message, msg, service_config)
-        
-        # Подтверждаем сообщение
-        #await msg.ack()
+
+        # Обработка ошибок
+        if result_message.data.error_message:
+            #TODO СДЕЛАТЬ ОБРАБОТКУ ОШИБОК
+            logger.error(f"❌ 'error' in result_message: {result_message.data.error_message}")
+            await msg.ack() # В парашу его не рабочее
+
                 
     except Exception as e:
         logger.error(f"❌ Message processing failed: {e}")

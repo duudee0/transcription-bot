@@ -14,10 +14,12 @@ from contextlib import asynccontextmanager
 
 from common.models import TaskMessage, ResultMessage, ResultData, TaskData, MessageType
 from common.publisher import Publisher
+from common.service_config import get_service_url
 
 RABBIT_URL = os.getenv("RABBIT_URL", "amqp://guest:guest@rabbitmq:5672/")
 WRAPPER_HOST = os.getenv("WRAPPER_HOST", "0.0.0.0")
 WRAPPER_PORT = int(os.getenv("WRAPPER_PORT", "8003"))
+WRAPPER_HOST_DOCKER = "wrapper"  # Имя контейнера в Docker сети
 
 # Глобальный publisher
 publisher = None
@@ -122,15 +124,13 @@ async def create_task(
             target_services = MULTI_SERVICE_CHAINS[task_request.task_type]
             logger.info(f"🔗 Multi-service chain: {task_request.task_type} -> {target_services}")
         else:
-            # Старая логика для одиночных задач
-            service_config = SERVICE_CONFIGS.get(task_request.task_type)
-            if service_config:
-                target_services = [service_config["service_name"]]
+            #! ОБРАЩЕНИЕ НАПРЯМУЮ ЗНАЯ НАЗВАНИЯ КОНТЕЙНЕРА ИЛИ СЕРВИСА
+            # Логика для одиночных задач
+            target_services = get_service_url(task_request)
+
     
-    # TODO: ПРОДАКШЕН НУЖНО ФИКСИТЬ
     # Подготавливаем input_data с callback_url для wrapper'а
-    wrapper_container_name = "wrapper"  # Имя контейнера в Docker сети
-    wrapper_callback_url = f"http://{wrapper_container_name}:{WRAPPER_PORT}/internal/webhook/{task_id}"
+    wrapper_callback_url = f"http://{WRAPPER_HOST_DOCKER}:{WRAPPER_PORT}/internal/webhook/{task_id}"
     enhanced_input_data = {
         **task_request.input_data,
         "wrapper_callback_url": wrapper_callback_url,  # для сервисов

@@ -4,6 +4,7 @@ WORKDIR /app
 # Копируем общие модули
 COPY common/models.py /app/common/models.py
 COPY common/publisher.py /app/common/publisher.py
+COPY common/service_config.py /app/common/service_config.py
 
 # Копируем зависимости воркера
 COPY wrapper/requirements.txt .

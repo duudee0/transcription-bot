@@ -1,38 +1,27 @@
 # common/service_config.py
 """
-ЦЕНТРАЛИЗОВАННАЯ КОНФИГУРАЦИЯ СЕРВИСОВ
-Изменяйте здесь при добавлении новых сервисов
+ГЛОБАЛЬНЫЙ РЕЕСТР СЕРВИСОВ
+Только базовые URL сервисов, без привязки к типам задач
 """
 
-# Mapping: task_type -> service_name
-TASK_TO_SERVICE = {
-    "analyze_text": "llm-service",
-    "promt_response": "llm-service",
-    "generate_response": "gigachat-service", 
-    "process_image": "image-service",
-}
+from typing import Dict, Optional
 
-# Базовые URL сервисов
-SERVICE_URLS = {
+# Простой реестр: service_name -> base_url
+SERVICE_REGISTRY: Dict[str, str] = {
     "llm-service": "http://llm-service:8000",
     "gigachat-service": "http://gigachat-service:8000", 
-    "image-service": "http://image-service:8000", # Тестировать нерабочий сервис
+    "image-service": "http://image-service:8000",
+    "voice-service": "http://voice-service:8000",
+    "worker": "http://worker:8080",
+    "wrapper": "http://wrapper:8000",
+    "text-analyzer": "http://text-analyzer:8000",
+    "animation-generator": "http://animation-generator:8000"
 }
 
-# Полные конфиги (для обратной совместимости)
-SERVICE_CONFIGS = {
-    task_type: {
-        "service_name": service_name,
-        "base_url": SERVICE_URLS[service_name],
-        "endpoint": "/api/v1/process"
-    }
-    for task_type, service_name in TASK_TO_SERVICE.items()
-}
-
-def get_service_config(task_type: str):
-    """Получить конфиг для типа задачи"""
-    return SERVICE_CONFIGS.get(task_type)
-
-def get_service_url(service_name: str):
+def get_service_url(service_name: str) -> Optional[str]:
     """Получить URL сервиса по имени"""
-    return SERVICE_URLS.get(service_name)
+    return SERVICE_REGISTRY.get(service_name)
+
+def get_all_services() -> Dict[str, str]:
+    """Получить реестр всех сервисов"""
+    return SERVICE_REGISTRY.copy()

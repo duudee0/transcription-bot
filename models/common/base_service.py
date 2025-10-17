@@ -245,7 +245,6 @@ class BaseService:
                     **result_data.result,            # Распаковываем результат текущего сервиса
                 }
 
-            print(f"☢️ task_message.data.input_data:  {str(next_input_data)} \n\n result_data: {str(result_data.result)}\n\n")
 
             # Создаем новую задачу для следующего сервиса
             next_task = TaskMessage(
