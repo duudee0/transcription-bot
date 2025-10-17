@@ -1,0 +1,7 @@
+#pydantic
+fastapi
+uvicorn
+httpx
+aiohttp
+#aio_pika
+pyTelegramBotApi

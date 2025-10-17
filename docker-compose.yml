@@ -120,6 +120,34 @@ services:
       - frontend
 
 
+  bot:
+    build:
+      context: .
+      dockerfile: telegram-bot/Dockerfile
+    container_name: telegram-bot
+    depends_on:
+      - rabbitmq
+      - wrapper
+    environment:
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN}
+      WRAPPER_URL: "http://wrapper:8003"
+      BOT_CALLBACK_HOST: "0.0.0.0"
+      BOT_CALLBACK_PORT: "9000"
+      BOT_CALLBACK_HOST_DOCKER: "telegram-bot"
+      # Этот URL вкладывается в задачи как client_callback_url (wrapper будет POSTить сюда)
+      CLIENT_CALLBACK_URL_FOR_WRAPPER: "http://telegram-bot:9000/client/webhook"
+      POLL_INTERVAL: "1.0"
+      GLOBAL_TIMEOUT: "60"
+    ports:
+      - "9000:9000"  # если вы хотите пробросить для отладки
+    networks:
+      - frontend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 networks:
   frontend:
   internal:

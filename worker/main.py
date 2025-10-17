@@ -370,10 +370,11 @@ async def handle_message(msg: IncomingMessage, publisher: Publisher):
         result_message = await process_task(task_message, msg, service_config)
 
         # Обработка ошибок
-        if result_message.data.error_message:
-            #TODO СДЕЛАТЬ ОБРАБОТКУ ОШИБОК
-            logger.error(f"❌ 'error' in result_message: {result_message.data.error_message}")
-            await msg.ack() # В парашу его не рабочее
+        if result_message:
+            if result_message.data.error_message:
+                #TODO СДЕЛАТЬ ОБРАБОТКУ ОШИБОК
+                logger.error(f"❌ 'error' in result_message: {result_message.data.error_message}")
+                await msg.ack() # В парашу его не рабочее
 
                 
     except Exception as e:

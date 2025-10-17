@@ -288,7 +288,7 @@ async def send_webhook_to_client(url: str, data: dict):
             else:
                 logger.warning(f"⚠️ Client webhook failed: {response.status_code}")
     except Exception as e:
-        logger.error(f"❌ Failed to send webhook to client: {e}")
+        logger.error(f"❌ Failed to send webhook to client: {e} \n url: {url}")
 
 @app.get("/health")
 async def health():
