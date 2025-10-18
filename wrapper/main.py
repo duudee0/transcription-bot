@@ -25,12 +25,20 @@ WRAPPER_HOST_DOCKER = "wrapper"  # Имя контейнера в Docker сет�
 publisher = None
 
 # Задачи, которые должны проходить через несколько сервисов (последовательно)
+#TODO: ПОКА ЧТО ХАРДКОД ТАК УДОБНЕЕ ТЕСТИРОВАТЬ А ВООБЩЕ ДОБАВИТЬ НОРМ API ДЛЯ ТАКОГО
 MULTI_SERVICE_CHAINS = {
     "comprehensive_analysis": ["llm-service", "gigachat-service"],
     "text_to_speech": ["llm-service", "voice-service"], 
     "content_creation": ["gigachat-service", "image-service"],
     "full_processing": ["llm-service", "gigachat-service", "image-service"]
 }
+
+"""
+! ДОБАВИТЬ ОБРАБОТКУ ОШИБОК ДЛЯ ОТПРАВКИ КЛИЕНТУ ОШИБКИ
+! НЕ ВЫДАВАТЬ ПОЛНЫЕ ОШИБКИ ТОЛЬКО КРАТКОЕ ИХ ОПИСАНИЕ 
+! ПЕРЕРАБОТАТЬ ПОД ЭТО ОЧЕРЕДЬ RESULT НА ДРУГУЮ
+
+"""
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

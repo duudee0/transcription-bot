@@ -77,13 +77,13 @@ async def check_service_ready(service_config: dict) -> bool:
             health_response = await client.get(health_url)
             
             try:
-                health_status = health_response.json().status == 'ok'
+                health_status = health_response.json()['status'] == 'ok'
             except:
                 health_status = True
 
-            logger.info(f" 🩷 Status: {health_status}")
+            logger.info(f" 🩷 Status: {health_status}: {health_response.json()['status']}")
 
-            if health_response.status_code != 200 and not health_status:
+            if health_response.status_code != 200 or not health_status:
                 logger.warning(f"   ❌ Health check failed: {health_response.status_code}")
                 return None
             
