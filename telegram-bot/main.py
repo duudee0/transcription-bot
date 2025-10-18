@@ -1,59 +1,94 @@
+from html import escape
 import os
 import asyncio
 import json
 import logging
-from typing import Optional, Dict, Any, List
-import httpx
-import uvicorn
-from fastapi import FastAPI, Request, HTTPException
-from telebot.async_telebot import AsyncTeleBot
-from telebot.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from typing import Optional, Dict, Any, List, Set
+from contextlib import asynccontextmanager
 
-# ---------- Конфигурация (без плейсхолдеров, устанавливайте через env) ----------
+import httpx
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+
+# ---------- Конфигурация ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN must be set in environment")
 
-# URL на ваш wrapper (тот, который вы показывали в коде)
 WRAPPER_URL = os.getenv("WRAPPER_URL", "http://localhost:8003")
-
-# Где будет слушать HTTP сервер бота (для wrapper'а нужен доступ к этому хосту)
-# Для локальной разработки: BOT_CALLBACK_HOST="localhost", BOT_CALLBACK_PORT=9000
-# Для Docker-сети: укажите имя контейнера здесь в BOT_CALLBACK_HOST_DOCKER (например "bot-wrapper")
 BOT_CALLBACK_HOST = os.getenv("BOT_CALLBACK_HOST", "0.0.0.0")
 BOT_CALLBACK_PORT = int(os.getenv("BOT_CALLBACK_PORT", "9000"))
-BOT_CALLBACK_HOST_DOCKER = os.getenv("BOT_CALLBACK_HOST_DOCKER", "telegram-bot")  # имя контейнера/hostname внутри docker-net
+BOT_CALLBACK_HOST_DOCKER = os.getenv("BOT_CALLBACK_HOST_DOCKER", "telegram-bot")
 
-# Адрес, который мы передаём в wrapper как callback_url (wrapper будет POSTить туда результат)
-# Wrapper в вашем коде вызывает client_callback_url напрямую, передавая объект {"task_id":..., "status":..., ...}
 CLIENT_CALLBACK_URL_FOR_WRAPPER = os.getenv(
     "CLIENT_CALLBACK_URL_FOR_WRAPPER",
     f"http://{BOT_CALLBACK_HOST_DOCKER}:{BOT_CALLBACK_PORT}/client/webhook"
 )
 
-# Polling / timeout settings
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.0"))  # seconds between polls
-GLOBAL_TIMEOUT = int(os.getenv("GLOBAL_TIMEOUT", "60"))  # seconds max wait when polling
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.0"))
+GLOBAL_TIMEOUT = int(os.getenv("GLOBAL_TIMEOUT", "60"))
+
+# Глобальные переменные для управления задачами поллинга
+polling_tasks: Dict[str, asyncio.Task] = {}  # task_id -> polling task
+completed_tasks: Set[str] = set()  # task_id которые уже завершены через вебхук
 
 # ---------- Логирование ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tg-wrapper-bot")
 
-# ---------- HTTP и Telegram объекты ----------
-app = FastAPI(title="TG Wrapper Bot Server")
-bot = AsyncTeleBot(TELEGRAM_TOKEN)
+# ---------- Состояния FSM (Finite State Machine) ----------
+class TaskStates(StatesGroup):
+    """Состояния для создания задач через FSM"""
+    waiting_for_task_type = State()
+    waiting_for_input_data = State()
+    waiting_for_parameters = State()
+
+# ---------- Инициализация aiogram ----------
+# Используем MemoryStorage для FSM (в продакшене лучше Redis)
+storage = MemoryStorage()
+
+# Инициализируем бота с дефолтными настройками
+bot = Bot(
+    token=TELEGRAM_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)  # Автоматический HTML парсинг
+)
+
+# Создаем диспетчер и роутер
+dp = Dispatcher(storage=storage)
+router = Router()
+dp.include_router(router)
+
+# HTTP клиент для запросов к wrapper
 http_client = httpx.AsyncClient(timeout=30.0)
 
-# В памяти: map task_id -> list of chat_ids (поддержка нескольким пользователей, если нужно)
+# В памяти: map task_id -> list of chat_ids
 task_to_chats: Dict[str, List[int]] = {}
-# Сервисы состояния для удобства (task info)
-task_meta: Dict[str, Dict[str, Any]] = {}  # task_id -> info like {'type':..., 'created_by': chat_id}
+task_meta: Dict[str, Dict[str, Any]] = {}
 
 # ---------- Утилиты ----------
 def _safe_truncate(text: str, limit: int = 3500) -> str:
+    """Безопасное обрезание текста для Telegram"""
     if len(text) <= limit:
         return text
     return text[:limit-200] + "\n\n... (truncated)"
+
+def make_main_keyboard() -> ReplyKeyboardMarkup:
+    """Создает основную клавиатуру с командами"""
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="/test1"), KeyboardButton(text="/test2")],
+            [KeyboardButton(text="/task"), KeyboardButton(text="/mytasks")],
+            [KeyboardButton(text="/help")]
+        ],
+        resize_keyboard=True
+    )
+    return kb
 
 async def create_task_on_wrapper(
     task_type: str,
@@ -63,7 +98,7 @@ async def create_task_on_wrapper(
     timeout: int = 30,
     client_callback_url: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Создаёт задачу в wrapper; отдаёт JSON-ответ wrapper'а."""
+    """Создает задачу в wrapper и возвращает JSON-ответ"""
     payload = {
         "task_type": task_type,
         "input_data": input_data or {},
@@ -72,7 +107,6 @@ async def create_task_on_wrapper(
     }
     if service_chain:
         payload["service_chain"] = service_chain
-    # Указываем callback_url, чтобы wrapper звонил нам напрямую (если указан)
     if client_callback_url:
         payload["callback_url"] = client_callback_url
 
@@ -83,6 +117,7 @@ async def create_task_on_wrapper(
     return resp.json()
 
 async def poll_task_result(task_id: str, timeout: int) -> Dict[str, Any]:
+    """Поллинг результата задачи с wrapper"""
     url = f"{WRAPPER_URL.rstrip('/')}/api/v1/tasks/{task_id}"
     start = asyncio.get_event_loop().time()
     while True:
@@ -101,17 +136,25 @@ async def poll_task_result(task_id: str, timeout: int) -> Dict[str, Any]:
             return {"task_id": task_id, "status": "timeout", "error": "local_poll_timeout", "result": None}
         await asyncio.sleep(POLL_INTERVAL)
 
-# ---------- FastAPI endpoint для callback'ов от wrapper (к нам) ----------
+# ---------- FastAPI эндпоинты (оставляем без изменений) ----------
+from fastapi import FastAPI, Request, HTTPException
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan для управления ресурсами FastAPI"""
+    # Startup
+    logger.info("Starting FastAPI application")
+    yield
+    # Shutdown
+    await http_client.aclose()
+    logger.info("FastAPI application shutdown")
+
+app = FastAPI(title="TG Wrapper Bot Server", lifespan=lifespan)
+
 @app.post("/client/webhook")
 async def client_webhook(request: Request):
     """
-    Wrapper вызовет этот endpoint (client_callback_url), передавая JSON:
-    {
-      "task_id": "...",
-      "status": "completed" | "error" | ...,
-      "result": {...},
-      "error": "..."
-    }
+    Эндпоинт для callback'ов от wrapper'а
     """
     try:
         payload = await request.json()
@@ -130,62 +173,76 @@ async def client_webhook(request: Request):
 
     logger.info("Received client webhook for %s status=%s", task_id, status)
 
-    # Найдём чаты, ожидающие этот task_id
+    # Помечаем задачу как завершенную через вебхук
+    completed_tasks.add(task_id)
+
+
+    # БЕЗОПАСНО отменяем задачу поллинга для этого task_id, если она существует
+    if task_id in polling_tasks:
+        polling_task = polling_tasks.pop(task_id)  # Используем pop для атомарного удаления
+        if not polling_task.done():
+            polling_task.cancel()
+            try:
+                await polling_task
+            except asyncio.CancelledError:
+                logger.info("Polling task for %s cancelled due to webhook", task_id)
+            except Exception as e:
+                logger.warning("Error while cancelling polling task for %s: %s", task_id, e)
+        else:
+            logger.info("Polling task for %s was already completed", task_id)
+
+    # Находим чаты, ожидающие этот task_id
     chats = task_to_chats.get(task_id, [])
     if not chats:
         logger.warning("No chat mapping for task %s (webhook ignored)", task_id)
         return {"status": "no_mapping"}
 
-    # Отправляем каждому пользователю результат
+    # Формируем и отправляем сообщение каждому пользователю
     text = f"📬 Результат задачи {task_id} (push from wrapper):\n\nStatus: {status}\n"
     if error:
         text += f"Error: {error}\n"
     if result is not None:
         pretty = json.dumps(result, ensure_ascii=False, indent=2)
         pretty = _safe_truncate(pretty, 3500)
-        text += f"\nResult:\n<pre>{pretty}</pre>"
+        pretty_escaped = pretty
+        text += f"\nResult:\n<pre>{pretty_escaped}</pre>"
 
-    # Отправка (не блокируем основной поток — создаём задачи)
+    # Отправка с явным указанием parse_mode только когда используем HTML
     for chat_id in chats:
-        asyncio.create_task(bot.send_message(chat_id, text, parse_mode="HTML"))
+        if "<pre>" in text:
+            asyncio.create_task(bot.send_message(chat_id, text, parse_mode=ParseMode.HTML))
+        else:
+            asyncio.create_task(bot.send_message(chat_id, text))
 
-    # Можно пометить мета-инфо
     task_meta.setdefault(task_id, {})["last_webhook"] = payload
     return {"status": "delivered"}
 
-# ---------- Telegram handlers ----------
-# Кнопочная клавиатура с двумя тестовыми задачами и быстрыми командами
-def make_main_keyboard():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("/test1"), KeyboardButton("/test2"))
-    kb.add(KeyboardButton("/task"), KeyboardButton("/mytasks"))
-    kb.add(KeyboardButton("/help"))
-    return kb
-
-@bot.message_handler(commands=["start", "help"])
+# ---------- Обработчики Telegram (aiogram) ----------
+@router.message(CommandStart())
+@router.message(Command("help"))
 async def handle_start(message: Message):
+    """Обработчик команд /start и /help"""
     txt = (
         "Привет! Я бот-интерфейс к Task API Wrapper.\n\n"
         "Можешь отправить задачу в ручном формате:\n"
-        "/task <task_type> <json_input_data> [<json_parameters>]\n\n"
+        "/task 'task_type' 'json_input_data' ['json_parameters']\n\n"
         "Или воспользуйся тестовыми кнопками ниже.\n\n"
         "Пример ручной команды:\n"
         "/task analyze_text {\"text\":\"Привет мир\"} {\"detailed_analysis\":true}\n"
     )
-    await bot.send_message(message.chat.id, txt, reply_markup=make_main_keyboard())
+    await message.answer(txt, reply_markup=make_main_keyboard(), parse_mode='HTML')
 
-@bot.message_handler(commands=["test1"])
+@router.message(Command("test1"))
 async def handle_test1(message: Message):
-    """
-    Дружелюбная тестовая задача 1 — анализ текста (использует service_chain как пример).
-    """
+    """Обработчик тестовой задачи 1 - анализ текста"""
     chat_id = message.chat.id
     task_type = "analyze_text"
     input_data = {"text": "Это тест от Telegram-бота: проверьте работу анализа текста.", "language": "ru"}
     parameters = {"detailed_analysis": True}
     service_chain = ["llm-service"]
 
-    info_msg = await bot.send_message(chat_id, "Запускаю тестовую задачу 1 (анализ текста)...")
+    info_msg = await message.answer("Запускаю тестовую задачу 1 (анализ текста)...")
+    
     try:
         resp = await create_task_on_wrapper(
             task_type=task_type,
@@ -197,32 +254,36 @@ async def handle_test1(message: Message):
         )
     except Exception as e:
         logger.exception("Failed to create test1 task: %s", e)
-        await bot.send_message(chat_id, f"Ошибка при создании задачи: {e}")
+        await message.answer(f"Ошибка при создании задачи: {e}")
         return
 
     task_id = resp.get("task_id")
     if not task_id:
-        await bot.send_message(chat_id, f"Wrapper ответил без task_id: {resp}")
+        await message.answer(f"Wrapper ответил без task_id: {resp}")
         return
 
     # Сохраняем mapping task->chat
     task_to_chats.setdefault(task_id, []).append(chat_id)
     task_meta.setdefault(task_id, {}).update({"type": task_type, "created_by": chat_id})
 
-    await bot.edit_message_text("Тестовая задача отправлена. Ожидаю результат (вы получите push, когда wrapper пришлёт callback).", chat_id, info_msg.message_id)
+    # Запускаем polling fallback и сохраняем ссылку на задачу
+    polling_task = asyncio.create_task(poll_fallback(task_id, chat_id, GLOBAL_TIMEOUT))
+    polling_tasks[task_id] = polling_task
 
-@bot.message_handler(commands=["test2"])
+    await info_msg.edit_text("Тестовая задача отправлена. Ожидаю результат (вы получите push, когда wrapper пришлёт callback).")
+
+
+@router.message(Command("test2"))
 async def handle_test2(message: Message):
-    """
-    Дружелюбная тестовая задача 2 — генерация ответа (пример с service_chain).
-    """
+    """Обработчик тестовой задачи 2 - генерация ответа"""
     chat_id = message.chat.id
     task_type = "generate_response"
     input_data = {"prompt": "Придумай смешной твит про программистов."}
     parameters = {"max_tokens": 80}
     service_chain = ["gigachat-service"]
 
-    info_msg = await bot.send_message(chat_id, "Запускаю тестовую задачу 2 (генерация ответа)...")
+    info_msg = await message.answer("Запускаю тестовую задачу 2 (генерация ответа)...")
+    
     try:
         resp = await create_task_on_wrapper(
             task_type=task_type,
@@ -234,174 +295,249 @@ async def handle_test2(message: Message):
         )
     except Exception as e:
         logger.exception("Failed to create test2 task: %s", e)
-        await bot.send_message(chat_id, f"Ошибка при создании задачи: {e}")
+        await message.answer(f"Ошибка при создании задачи: {e}")
         return
 
     task_id = resp.get("task_id")
     if not task_id:
-        await bot.send_message(chat_id, f"Wrapper ответил без task_id: {resp}")
+        await message.answer(f"Wrapper ответил без task_id: {resp}")
         return
 
     task_to_chats.setdefault(task_id, []).append(chat_id)
     task_meta.setdefault(task_id, {}).update({"type": task_type, "created_by": chat_id})
 
-    await bot.edit_message_text("Тестовая задача отправлена. Ожидаю результат (push будет отправлен при callback от wrapper).", chat_id, info_msg.message_id)
+    # Запускаем polling fallback и сохраняем ссылку на задачу
+    polling_task = asyncio.create_task(poll_fallback(task_id, chat_id, GLOBAL_TIMEOUT))
+    polling_tasks[task_id] = polling_task
 
-@bot.message_handler(commands=["task"])
-async def handle_task(message: Message):
+    await info_msg.edit_text("Тестовая задача отправлена. Ожидаю результат (push будет отправлен при callback от wrapper).")
+
+@router.message(Command("task"))
+async def handle_task_command(message: Message, state: FSMContext):
     """
-    Ожидаемый формат:
-    /task <task_type> <input_data_json> [parameters_json]
-    (Если не хотите polling — передаём callback_url явно, иначе бот будет poll'ить по-старому.)
+    Обработчик команды /task - начинает процесс создания задачи через FSM
     """
-    chat_id = message.chat.id
-    text = message.text or ""
-    # простой парсинг: как в предыдущей версии — гибкий экстракт JSON'ов
+    await message.answer(
+        "Давайте создадим задачу. Введите тип задачи (например, 'analyze_text'):",
+        reply_markup=ReplyKeyboardRemove()  # Убираем клавиатуру для чистого ввода
+    )
+    await state.set_state(TaskStates.waiting_for_task_type)
+
+@router.message(TaskStates.waiting_for_task_type)
+async def handle_task_type(message: Message, state: FSMContext):
+    """Получаем тип задачи и запрашиваем input_data"""
+    await state.update_data(task_type=message.text.strip())
+    await message.answer("Отлично! Теперь введите input_data в формате JSON:")
+    await state.set_state(TaskStates.waiting_for_input_data)
+
+@router.message(TaskStates.waiting_for_input_data)
+async def handle_input_data(message: Message, state: FSMContext):
+    """Получаем input_data и запрашиваем parameters (опционально)"""
     try:
-        rest = text[len("/task"):].strip()
-        first_space = rest.find(" ")
-        if first_space == -1:
-            await bot.send_message(chat_id, "Нужно указать task_type и input_data JSON. Смотрите /help.")
-            return
-        task_type = rest[:first_space].strip()
-        remainder = rest[first_space+1:].strip()
-
-        def extract_json_prefix(s: str):
-            s = s.lstrip()
-            if not s:
-                return None, s
-            if s[0] not in ('{','['):
-                return None, s
-            open_ch = s[0]
-            close_ch = '}' if open_ch == '{' else ']'
-            depth = 0
-            for i, ch in enumerate(s):
-                if ch == open_ch:
-                    depth += 1
-                elif ch == close_ch:
-                    depth -= 1
-                    if depth == 0:
-                        return s[:i+1], s[i+1:].strip()
-            return None, s
-
-        json1_str, tail = extract_json_prefix(remainder)
-        if not json1_str:
-            await bot.send_message(chat_id, "Не получилось распознать JSON input_data.")
-            return
-        input_data = json.loads(json1_str)
-        parameters = {}
-        if tail:
-            j2, _ = extract_json_prefix(tail)
-            if j2:
-                parameters = json.loads(j2)
-    except json.JSONDecodeError as e:
-        await bot.send_message(chat_id, f"JSON parse error: {e}")
-        return
-    except Exception as e:
-        logger.exception("Error parsing /task: %s", e)
-        await bot.send_message(chat_id, f"Ошибка парсинга команды: {e}")
+        input_data = json.loads(message.text)
+    except json.JSONDecodeError:
+        await message.answer("Неверный формат JSON. Попробуйте еще раз:")
         return
 
-    # опционально берем service_chain из input_data или parameters
-    service_chain = input_data.get("service_chain") or parameters.get("service_chain")
-    timeout = int(parameters.get("timeout", GLOBAL_TIMEOUT))
+    await state.update_data(input_data=input_data)
+    
+    # Предлагаем ввести parameters или пропустить
+    await message.answer(
+        "Введите parameters в формате JSON (или отправьте 'skip' для пропуска):"
+    )
+    await state.set_state(TaskStates.waiting_for_parameters)
 
-    status_msg = await bot.send_message(chat_id, f"Отправляю задачу '{task_type}' в wrapper...")
+@router.message(TaskStates.waiting_for_parameters)
+async def handle_parameters(message: Message, state: FSMContext):
+    """Получаем parameters и создаем задачу"""
+    user_data = await state.get_data()
+    
+    # Обрабатываем parameters
+    parameters = {}
+    if message.text.lower() != 'skip':
+        try:
+            parameters = json.loads(message.text)
+        except json.JSONDecodeError:
+            await message.answer("Неверный формат JSON. Задача будет создана без parameters.")
+    
+    # Создаем задачу
+    status_msg = await message.answer("Отправляю задачу в wrapper...")
+    
     try:
-        # Передаём client_callback_url — чтобы wrapper звонил напрямую; если не хотите, можно убрать
         wrapper_resp = await create_task_on_wrapper(
-            task_type=task_type,
-            input_data=input_data,
+            task_type=user_data['task_type'],
+            input_data=user_data['input_data'],
             parameters=parameters,
-            service_chain=service_chain,
-            timeout=timeout,
+            timeout=GLOBAL_TIMEOUT,
             client_callback_url=CLIENT_CALLBACK_URL_FOR_WRAPPER
         )
-    except httpx.HTTPStatusError as e:
-        logger.exception("Wrapper returned error: %s", e)
-        await bot.send_message(chat_id, f"Ошибка от wrapper: {e.response.status_code} {e.response.text}")
-        return
     except Exception as e:
-        logger.exception("Failed to send task to wrapper: %s", e)
-        await bot.send_message(chat_id, f"Не удалось создать задачу: {e}")
+        logger.exception("Failed to create task: %s", e)
+        await message.answer(f"Ошибка при создании задачи: {e}")
+        await state.clear()
         return
 
     task_id = wrapper_resp.get("task_id")
     if not task_id:
-        await bot.send_message(chat_id, f"Wrapper ответил без task_id: {wrapper_resp}")
+        await message.answer(f"Wrapper ответил без task_id: {wrapper_resp}")
+        await state.clear()
         return
 
     # Сохраняем mapping и мета
-    task_to_chats.setdefault(task_id, []).append(chat_id)
-    task_meta.setdefault(task_id, {}).update({"type": task_type, "created_by": chat_id})
+    task_to_chats.setdefault(task_id, []).append(message.chat.id)
+    task_meta.setdefault(task_id, {}).update({
+        "type": user_data['task_type'], 
+        "created_by": message.chat.id
+    })
 
-    # По умолчанию — отправляем пользователю сообщение и говорим ждать push (callback).
-    await bot.edit_message_text(f"Задача отправлена, task_id: {task_id}. Результат придёт сюда при callback от wrapper (push).", chat_id, status_msg.message_id)
+    await status_msg.edit_text(
+        f"Задача отправлена, task_id: {task_id}. "
+        f"Результат придёт сюда при callback от wrapper (push)."
+    )
 
-    # Также запустим опциональный polling в фоне как fallback — если wrapper не пришлёт callback.
-    async def poll_fallback():
-        try:
-            status_obj = await poll_task_result(task_id=task_id, timeout=timeout)
-            st = status_obj.get("status")
-            if st == "completed":
-                result = status_obj.get("result") or {}
-                pretty = _safe_truncate(json.dumps(result, ensure_ascii=False, indent=2), 3500)
-                await bot.send_message(chat_id, f"✅ (poll) Задача {task_id} выполнена:\n<pre>{pretty}</pre>", parse_mode="HTML")
-            elif st == "error":
-                err = status_obj.get("error") or "unknown"
-                await bot.send_message(chat_id, f"❌ (poll) Задача {task_id} завершилась с ошибкой: {err}")
-            elif st == "timeout":
-                await bot.send_message(chat_id, f"⏰ (poll) Таймаут ожидания результата для {task_id}.")
-            else:
-                await bot.send_message(chat_id, f"(poll) Статус задачи {task_id}: {st}.")
-        except Exception as e:
-            logger.exception("Error in poll fallback for %s: %s", task_id, e)
-            await bot.send_message(chat_id, f"Ошибка при polling для {task_id}: {e}")
+    # Запускаем polling fallback и сохраняем ссылку на задачу
+    polling_task = asyncio.create_task(poll_fallback(task_id, message.chat.id, GLOBAL_TIMEOUT))
+    polling_tasks[task_id] = polling_task
+    
+    await state.clear()
+    await message.answer("Что дальше?", reply_markup=make_main_keyboard())
 
-    # Запускаем polling fallback, не блокируя
-    asyncio.create_task(poll_fallback())
+async def poll_fallback(task_id: str, chat_id: int, timeout: int):
+    """
+    Fallback polling на случай если wrapper не пришлет callback
+    С проверкой, не пришел ли уже вебхук
+    """
+    try:
+        # Проверяем, не пришел ли уже вебхук для этой задачи
+        if task_id in completed_tasks:
+            logger.info("Skipping polling for %s - already completed via webhook", task_id)
+            return
 
-@bot.message_handler(commands=["mytasks"])
+        start_time = asyncio.get_event_loop().time()
+        
+        while True:
+            # Еще раз проверяем перед каждым запросом
+            if task_id in completed_tasks:
+                logger.info("Polling cancelled for %s - webhook received", task_id)
+                return
+
+            # Проверяем таймаут
+            if asyncio.get_event_loop().time() - start_time > timeout:
+                await bot.send_message(chat_id, f"⏰ (poll) Таймаут ожидания результата для {escape(task_id)}.")
+                break
+
+            try:
+                status_obj = await poll_task_result(task_id=task_id, timeout=5)  # Короткий таймаут для каждого запроса
+                st = status_obj.get("status")
+                
+                if st == "completed":
+                    result = status_obj.get("result") or {}
+                    pretty = _safe_truncate(json.dumps(result, ensure_ascii=False, indent=2), 3500)
+                    pretty_escaped = escape(pretty)
+                    await bot.send_message(
+                        chat_id, 
+                        f"✅ (poll) Задача {escape(task_id)} выполнена:\n<pre>{pretty_escaped}</pre>",
+                        parse_mode=ParseMode.HTML
+                    )
+                    break
+                elif st == "error":
+                    err = status_obj.get("error") or "unknown"
+                    await bot.send_message(
+                        chat_id, 
+                        f"❌ (poll) Задача {escape(task_id)} завершилась с ошибкой: {escape(err)}"
+                    )
+                    break
+                elif st == "timeout":
+                    await bot.send_message(
+                        chat_id, 
+                        f"⏰ (poll) Таймаут выполнения задачи {escape(task_id)}."
+                    )
+                    break
+                else:
+                    # Задача еще выполняется, продолжаем поллинг
+                    await asyncio.sleep(POLL_INTERVAL)
+                    
+            except asyncio.CancelledError:
+                # Задача была отменена (вероятно, пришел вебхук)
+                logger.info("Polling task for %s was cancelled", task_id)
+                return
+            except Exception as e:
+                logger.warning("Error during polling for %s: %s", task_id, e)
+                await asyncio.sleep(POLL_INTERVAL)  # Ждем перед повторной попыткой
+
+    except asyncio.CancelledError:
+        logger.info("Polling task for %s was cancelled", task_id)
+    except Exception as e:
+        logger.exception("Error in poll fallback for %s: %s", task_id, e)
+        await bot.send_message(chat_id, f"Ошибка при polling для {task_id}: {e}")
+    finally:
+        # Очищаем ресурсы
+        polling_tasks.pop(task_id, None)
+        # Не очищаем completed_tasks сразу, они могут пригодиться для повторных проверок
+
+@router.message(Command("mytasks"))
 async def handle_mytasks(message: Message):
+    """Показывает задачи пользователя"""
     chat_id = message.chat.id
     tasks = [tid for tid, chats in task_to_chats.items() if chat_id in chats]
     if not tasks:
-        await bot.send_message(chat_id, "У вас нет запущенных задач (в текущей сессии).")
+        await message.answer("У вас нет запущенных задач (в текущей сессии).")
         return
+    
     out_lines = []
     for tid in tasks:
         meta = task_meta.get(tid, {})
         out_lines.append(f"{tid} — type={meta.get('type','?')}")
-    await bot.send_message(chat_id, "Ваши задачи (локальная привязка):\n" + "\n".join(out_lines))
+    
+    await message.answer("Ваши задачи (локальная привязка):\n" + "\n".join(out_lines))
 
-# ---------- Запуск: запускаем и FastAPI и Telegram polling в одном процессе ----------
-async def run_uvicorn():
-    """Запускает uvicorn server программно (awaitable)."""
-    config = uvicorn.Config(app, host=BOT_CALLBACK_HOST, port=BOT_CALLBACK_PORT, log_level="info")
+async def cleanup_old_tasks():
+    """Периодически очищает старые завершенные задачи чтобы избежать утечек памяти"""
+    while True:
+        await asyncio.sleep(3600)  # Каждый час
+        # Удаляем задачи, завершенные более 24 часов назад
+        # (здесь можно добавить логику с временными метками)
+        current_time = asyncio.get_event_loop().time()
+        # Пока просто ограничим размер completed_tasks
+        if len(completed_tasks) > 1000:
+            # Оставляем только последние 500 задач
+            tasks_list = list(completed_tasks)
+            for task_id in tasks_list[:-500]:
+                completed_tasks.discard(task_id)
+                task_meta.pop(task_id, None)
+                task_to_chats.pop(task_id, None)
+            logger.info("Cleaned up old completed tasks")
+
+# ---------- Запуск приложения ----------
+async def run_fastapi():
+    """Запускает FastAPI сервер"""
+    import uvicorn
+    config = uvicorn.Config(
+        app, 
+        host=BOT_CALLBACK_HOST, 
+        port=BOT_CALLBACK_PORT, 
+        log_level="info"
+    )
     server = uvicorn.Server(config)
-    # serve() завершится только при остановке сервера
     await server.serve()
 
 async def main():
-    logger.info("Starting combined FastAPI + Telegram bot...")
-    # Запускаем uvicorn сервер в фоне и polling бота
-    server_task = asyncio.create_task(run_uvicorn())
+    """Основная функция запуска"""
+    logger.info("Starting combined FastAPI + Aiogram bot...")
+    
+    # Запускаем обе службы параллельно
+    fastapi_task = asyncio.create_task(run_fastapi())
+    bot_task = asyncio.create_task(dp.start_polling(bot))
+    cleanup_tasks = asyncio.create_task(cleanup_old_tasks())
+    
     try:
-        # Запускаем бота polling (blocking but awaitable)
-        await bot.polling(non_stop=True)
-    finally:
-        # При выходе закрываем http клиент и останавливаем сервер
-        await http_client.aclose()
-        # Остановим uvicorn (если ещё жив)
-        if not server_task.done():
-            server_task.cancel()
-            try:
-                await server_task
-            except asyncio.CancelledError:
-                pass
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
+        await asyncio.gather(fastapi_task, bot_task, cleanup_tasks)
     except KeyboardInterrupt:
         logger.info("Shutdown requested by KeyboardInterrupt")
+    finally:
+        # Корректное завершение
+        await bot.session.close()
+        await http_client.aclose()
+
+if __name__ == "__main__":
+    asyncio.run(main())
