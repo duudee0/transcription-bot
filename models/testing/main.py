@@ -1,5 +1,5 @@
 from common.base_service import BaseService
-from common.models import TaskMessage, ResultData
+from common.models import PayloadType, TaskMessage, Data
 from fastapi import HTTPException
 import asyncio
 from typing import Dict, Any
@@ -35,12 +35,12 @@ class LLMService(BaseService):
         #     )
         pass
     
-    async def _process_task_logic(self, task_message: TaskMessage) -> ResultData:
+    async def _process_task_logic(self, task_message: TaskMessage) -> Data:
         """Логика обработки задачи для LLM сервиса"""
         await asyncio.sleep(TESTING_SLEEP)  # Имитация обработки
         
         task_type = task_message.data.task_type
-        input_data = task_message.data.input_data
+        input_data = task_message.data
         
         if task_type == "analyze_text":
             result = await self._analyze_text(input_data)
@@ -51,9 +51,9 @@ class LLMService(BaseService):
         
         print(f" 🙏 {result}")
         
-        return ResultData(
-            success=True,
-            result=result,
+        return Data(
+            payload_type = PayloadType.TEXT,
+            payload = result,
             execution_metadata={
                 "processing_time_ms": 150.0,
                 "task_type": task_type,
@@ -61,10 +61,10 @@ class LLMService(BaseService):
             }
         )
     
-    async def _analyze_text(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    async def _analyze_text(self, input_data: Data) -> Dict[str, Any]:
         """Анализ текста"""
-        text = input_data.get("text", "")
-        language = input_data.get("language", "ru")
+        text = input_data.payload.get('text', '')
+        language = input_data.payload.get("language", "ru")
         
         words = text.split()
         
@@ -73,7 +73,7 @@ class LLMService(BaseService):
         return {  #TODO НЕ возвращаются данные почему то
             "task": "text_analysis",
             "word_count": len(words),
-            "prompt": prompt,
+            "text": prompt,
             "language": language,
             "estimated_reading_time_sec": max(1, len(words) // 3),
             "contains_questions": "?" in text,
@@ -89,7 +89,7 @@ class LLMService(BaseService):
         return {
             "task": "response_generation",
             "original_prompt": prompt,
-            "generated_response": f"Это тестовый ответ на: '{prompt}'. [Здесь будет реальный LLM]",
+            "text": f"Это тестовый ответ на: '{prompt}'. [Здесь будет реальный LLM]",
             "response_length": len(prompt) + 50
         }
 

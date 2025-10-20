@@ -1,5 +1,5 @@
 from common.base_service import BaseService
-from common.models import TaskMessage, ResultData
+from common.models import PayloadType, TaskMessage, Data
 from fastapi import HTTPException
 import os
 from typing import Dict, Any
@@ -70,19 +70,19 @@ class GigaChatService(BaseService):
             raise HTTPException(status_code=500, detail=f"Prompt is required for generate_response task")
     # TODO воркер не хочет нормально обрабатывать ошибки
 
-    async def _process_task_logic(self, task_message: TaskMessage) -> ResultData:
+    async def _process_task_logic(self, task_message: TaskMessage) -> Data:
         """Логика обработки задачи через GigaChat"""
         prompt = task_message.data.input_data.get("prompt", "")
         
         # Вызываем GigaChat
         response = await self._call_gigachat(prompt)
         
-        return ResultData(
-            success=True,
-            result={
+        return Data(
+            payload_type = PayloadType.TEXT,
+            payload={
                 "task": "response_generation",
                 "original_prompt": prompt,
-                "generated_response": response,
+                "text": response,
                 "model_used": self.gigachat_model
             },
             execution_metadata={

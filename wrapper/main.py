@@ -12,7 +12,7 @@ from datetime import datetime
 import logging
 from contextlib import asynccontextmanager
 
-from common.models import TaskMessage, ResultMessage, ResultData, TaskData, MessageType
+from common.models import TaskMessage, ResultMessage, Data ,MessageType
 from common.publisher import Publisher
 from common.service_config import get_service_url
 
@@ -39,6 +39,37 @@ MULTI_SERVICE_CHAINS = {
 ! ПЕРЕРАБОТАТЬ ПОД ЭТО ОЧЕРЕДЬ RESULT НА ДРУГУЮ
 
 """
+
+import secrets
+from common.models import PayloadType, Data, TaskMessage, ResultMessage, MessageType
+
+def infer_payload_type(payload: Dict[str, Any]) -> PayloadType:
+    """Простая эвристика для определения payload_type."""
+    if not isinstance(payload, dict):
+        return PayloadType.TEXT
+    if "text" in payload and isinstance(payload["text"], str):
+        return PayloadType.TEXT
+    if "url" in payload and isinstance(payload["url"], str):
+        return PayloadType.URL
+    # common audio/video keys
+    if any(k in payload for k in ("audio_url", "audio")):
+        return PayloadType.AUDIO
+    if any(k in payload for k in ("video_url", "video")):
+        return PayloadType.VIDEO
+    if any(k in payload for k in ("file_url", "file")):
+        return PayloadType.FILE
+    # fallback
+    return PayloadType.TEXT
+
+def make_wrapper_callback(task_id: str, secret: str) -> str:
+    """
+    Возвращает internal wrapper callback, который сервисы будут
+    вызывать чтобы доставить final result.
+    Мы используем имя контейнера (WRAPPER_HOST_DOCKER) для докер-сети.
+    """
+    return f"http://{WRAPPER_HOST_DOCKER}:{WRAPPER_PORT}/internal/webhook/{task_id}/{secret}"
+
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -116,86 +147,86 @@ async def get_publisher():
     return publisher
 
 @app.post("/api/v1/tasks", response_model=TaskResponse)
-async def create_task(
-    task_request: TaskRequest,
-    background_tasks: BackgroundTasks
-):
-    """Создание новой задачи"""
-    task_id = str(uuid.uuid4()) 
-    
-    # Определяем целевые сервисы
+async def create_task(task_request: TaskRequest, background_tasks: BackgroundTasks):
+    """Создание новой задачи — формируем TaskMessage и публикуем в очередь."""
+    task_id = str(uuid.uuid4())
+    # determine target chain
     target_services = task_request.service_chain
-    
     if not target_services:
-        # ПРОВЕРЯЕМ МНОГОСЕРВИСНЫЕ ЦЕПОЧКИ
         if task_request.task_type in MULTI_SERVICE_CHAINS:
             target_services = MULTI_SERVICE_CHAINS[task_request.task_type]
             logger.info(f"🔗 Multi-service chain: {task_request.task_type} -> {target_services}")
         else:
-            #! ОБРАЩЕНИЕ НАПРЯМУЮ ЗНАЯ НАЗВАНИЯ КОНТЕЙНЕРА ИЛИ СЕРВИСА
-            # Логика для одиночных задач
-            target_services = get_service_url(task_request)
+            # single service: map task_type -> service_name from config
+            svc_conf = SERVICE_CONFIGS.get(task_request.task_type)
+            if not svc_conf:
+                raise HTTPException(status_code=400, detail="Unknown task_type and no service_chain provided")
+            target_services = [svc_conf["service_name"]]
 
-    
-    # Подготавливаем input_data с callback_url для wrapper'а
-    wrapper_callback_url = f"http://{WRAPPER_HOST_DOCKER}:{WRAPPER_PORT}/internal/webhook/{task_id}"
-    enhanced_input_data = {
-        **task_request.input_data,
-        "wrapper_callback_url": wrapper_callback_url,  # для сервисов
-        "client_callback_url": task_request.callback_url  # для wrapper'а
-    }
-    
-    # Создаем TaskMessage
+    # security: generate per-task secret for internal webhook
+    webhook_secret = secrets.token_urlsafe(16)
+
+    # internal wrapper callback that services will call with final result
+    wrapper_callback_url = make_wrapper_callback(task_id, webhook_secret)
+
+    # build Data object for TaskMessage
+    inferred_type = infer_payload_type(task_request.input_data or {})
+    data_obj = Data(
+        task_type=task_request.task_type,
+        payload_type=inferred_type,
+        payload=task_request.input_data or {},
+        wrapper_callback_url=wrapper_callback_url,
+        callback_url=None,
+        original_message_id=task_id,
+        parameters=task_request.parameters or {},
+        execution_metadata={}
+    )
+
+    # Build TaskMessage (message_id may be string UUID; pydantic accepts)
     task_message = TaskMessage(
         message_id=task_id,
         source_service="api-wrapper",
         target_services=target_services,
-        data=TaskData(
-            task_type=task_request.task_type,
-            input_data=enhanced_input_data,
-            parameters=task_request.parameters or {}
-        )
+        data=data_obj
     )
-    
-    # Сохраняем в хранилище
+
+    # Save in memory store — **do not include client_callback_url in the outgoing message**
     task_store[task_id] = {
         "status": "accepted",
         "created_at": datetime.now(),
         "updated_at": datetime.now(),
-        "client_callback_url": task_request.callback_url,  # сохраняем отдельно
-        "task_message": task_message.model_dump(),
-        "result": None
+        "client_callback_url": task_request.callback_url,   # ONLY stored locally
+        "webhook_secret": webhook_secret,
+        "task_message": task_message.model_dump(),  # for debugging / re-publish
+        "result": None,
+        "error": None
     }
-    
-    # Получаем publisher и отправляем в очередь
+
+    # Publish to queue
     pub = await get_publisher()
     await pub.publish_task(task_message)
-    
+
     logger.info(f"📨 Task created: {task_id}, type: {task_request.task_type}")
-    
-    # Если указан callback_url, используем асинхронный режим
+
     if task_request.callback_url:
+        # client requested async callback
         return TaskResponse(
-            task_id=str(task_id),
+            task_id=task_id,
             status="accepted",
             message="Task queued for processing, result will be sent via webhook",
             created_at=datetime.now()
         )
-    
-    # Иначе ждем результат синхронно (с таймаутом)
-    background_tasks.add_task(
-        wait_for_task_completion,
-        str(task_id),
-        task_request.timeout
-    )
-    
+
+    # sync path: schedule background waiter and return processing response
+    background_tasks.add_task(wait_for_task_completion, task_id, task_request.timeout)
     return TaskResponse(
-        task_id=str(task_id),
-        status="processing", 
-        message="Task is being processed",
-        estimated_time=30.0,
+        task_id=task_id,
+        status="processing",
+        message="Task queued and being processed",
+        estimated_time=float(task_request.timeout),
         created_at=datetime.now()
     )
+
 
 @app.get("/api/v1/tasks/{task_id}", response_model=StatusResponse)
 async def get_task_status(task_id: str):
@@ -213,45 +244,80 @@ async def get_task_status(task_id: str):
         updated_at=task["updated_at"]
     )
 
-@app.post("/internal/webhook/{task_id}")
-async def handle_webhook(task_id: str, request: Request):
-    """Внутренний вебхук для получения ФИНАЛЬНЫХ результатов от сервисов"""
+@app.post("/internal/webhook/{task_id}/{secret}")
+async def handle_webhook(task_id: str, secret: str, request: Request):
+    """Internal webhook for receiving FINAL results from services.
+       URL contains secret token that wrapper issued when task created."""
     try:
-        # Получаем JSON из запроса
-        payload = await request.json()
-        logger.info(f"📬 Final webhook received for task: {task_id}")
-        
-        # Парсим в ResultMessage
-        result_message = ResultMessage.model_validate(payload)
-        
         if task_id not in task_store:
             logger.warning(f"Webhook for unknown task: {task_id}")
-            return {"status": "ignored"}
-        
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        stored = task_store[task_id]
+        expected = stored.get("webhook_secret")
+        if not expected or secret != expected:
+            logger.warning(f"Invalid webhook secret for task {task_id}")
+            raise HTTPException(status_code=403, detail="Invalid webhook secret")
+
+        payload = await request.json()
+        # validate as ResultMessage — tolerant to shapes
+        try:
+            result_message = ResultMessage.model_validate(payload)
+        except Exception:
+            # try nested 'data' dict presence — allow service to send just data
+            # If payload contains 'data', wrap into a ResultMessage skeleton
+            if isinstance(payload, dict) and "data" in payload:
+                result_message = ResultMessage(
+                    message_id=task_id,
+                    message_type=MessageType.RESULT,
+                    source_service=payload.get("source_service", "unknown"),
+                    target_services=None,
+                    original_message_id=task_id,
+                    data=Data.model_validate(payload["data"]),
+                    success=payload.get("success", True),
+                    error_message=payload.get("error_message")
+                )
+            else:
+                raise
+
+        # Update store
         task = task_store[task_id]
-        task["status"] = "completed" if result_message.data.success else "error"
-        task["result"] = result_message.data.result
-        task["error"] = result_message.data.error_message
+        # prefer data.success (bool) inside ResultMessage.data if present else top-level success
+        success_flag = getattr(result_message, "success", None)
+        if success_flag is None and result_message.data:
+            success_flag = getattr(result_message.data, "success", None)
+        task["status"] = "completed" if success_flag else "error"
+        # Normalize result & error fields
+        task["result"] = result_message.data.payload if result_message.data else None
+        task["error"] = result_message.error_message if result_message.data else result_message.error_message
         task["updated_at"] = datetime.now()
-        
-        logger.info(f"✅ Task {task_id} completed with status: {task['status']}")
-        
-        # Если у клиента есть callback_url, отправляем результат КЛИЕНТУ
+
+        logger.info(f"✅ Task {task_id} completed status={task['status']}")
+
+        # send client callback if provided (server-to-client)
         client_callback_url = task.get("client_callback_url")
         if client_callback_url:
-            await send_webhook_to_client(client_callback_url, {
+            # send concise payload to client
+            send_payload = {
                 "task_id": task_id,
                 "status": task["status"],
                 "result": task["result"],
-                "error": task.get("error")
-            })
-            logger.info(f"📤 Callback sent to CLIENT for task: {task_id}")
-        
+                "error": task["error"]
+            }
+            # fire-and-forget (don't block wrapper)
+            asyncio.create_task(send_webhook_to_client(client_callback_url, send_payload))
+            logger.info(f"📤 Client callback enqueued for task {task_id}")
+
+        # Optionally: delete webhook_secret to avoid replays (one-time)
+        task_store[task_id]["webhook_secret"] = None
+
         return {"status": "processed"}
-        
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"❌ Webhook processing error: {e}")
+        logger.exception(f"❌ Webhook processing error for {task_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/tasks")
 async def list_tasks():

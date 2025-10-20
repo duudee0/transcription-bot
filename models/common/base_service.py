@@ -1,4 +1,7 @@
 # models/common/base_service.py
+from datetime import datetime
+from enum import Enum
+import json
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional, Any, Dict, List
@@ -14,7 +17,7 @@ from uuid import UUID, uuid4
 
 from common.publisher import Publisher
 # Импортируем общие модели
-from common.models import TaskMessage, ResultMessage, ResultData, MessageType, TaskData
+from common.models import PayloadType, TaskMessage, ResultMessage, MessageType, Data
 
 
 class BaseService:
@@ -28,10 +31,10 @@ class BaseService:
         self.app = FastAPI(title=service_name, version=version)
         
         # Общее состояние
-        self.processing_history = {}
-        self.is_processing = False
-        self.current_task_id = None
-        self.processing_start_time = None
+        self.processing_history: Dict[str, Any] = {}
+        self.is_processing: bool = False
+        self.current_task_id: Optional[UUID] = None
+        self.processing_start_time: Optional[float] = None
         
         # Регистрируем стандартные эндпоинты
         self._register_common_endpoints()
@@ -115,14 +118,10 @@ class BaseService:
         """
         ОПРЕДЕЛЯЕТ, ДОЛЖЕН ЛИ СЕРВИС ОБРАБОТАТЬ СООБЩЕНИЕ
         """
-        if task_message.target_services:
-            # Если есть цепочка, проверяем что мы первый
-            return (task_message.target_services and 
-                    task_message.target_services[0] == self.service_name)
-        else:
-            # Если цепочки нет, проверяем по мы ли первые
-            return task_message.target_services[0] == self.service_name
-    
+        if not task_message.target_services:
+            return False
+        return task_message.target_services[0] == self.service_name
+        
     def _can_handle_task_type(self, task_type: str) -> bool:
         """
         ОПРЕДЕЛЯЕТ, МОЖЕТ ЛИ СЕРВИС ОБРАБОТАТЬ ТИП ЗАДАЧИ
@@ -140,17 +139,18 @@ class BaseService:
         try:
             # Парсим входящий JSON и валидируем как TaskMessage
             body = await request.json()
-            task_message = TaskMessage.model_validate(body)
+            task_message: TaskMessage = TaskMessage.model_validate(body)
             
             # Сохраняем в историю
             self.processing_history[str(task_message.message_id)] = {
                 "received_at": time.time(),
                 "source_service": task_message.source_service,
                 "target_services": task_message.target_services,
-                "task_type": task_message.data.task_type,
-                "input_data": task_message.data.input_data,
+                "task_type": task_message.data.task_type if task_message.data else None,
+                "payload": task_message.data.payload if task_message.data else None,
                 "status": "processing"
             }
+
             
             # Логируем получение
             print(f"[{time.time()}] {self.service_name} received task: {task_message.message_id}", file=sys.stderr)
@@ -162,7 +162,7 @@ class BaseService:
             await self._validate_task(task_message)
             
             # Проверяем поддержку вебхука
-            callback_url = task_message.data.input_data.get("callback_url")
+            callback_url = task_message.data.callback_url
             # webhook_supported = task_message.data.input_data.get("webhook_supported", False)
             
             # if callback_url and webhook_supported and not self.is_processing:
@@ -182,9 +182,11 @@ class BaseService:
                 source_service=self.service_name,
                 target_services=task_message.target_services,
                 original_message_id=task_message.message_id,
-                data=ResultData(
-                    success=True,
-                    result={"status": "accepted", "message": "Processing in background via webhook"},
+                success=True,
+                data=Data(
+                    task_type=task_message.data.task_type,
+                    payload_type = PayloadType.TEXT,
+                    payload={"status": "accepted", "text": "Processing in background via webhook"},
                     execution_metadata={
                         "processing_mode": "async_webhook",
                         "service": self.service_name,
@@ -222,7 +224,7 @@ class BaseService:
                 detail=f"Internal server error: {str(e)}"
             )       
     
-    async def _handle_service_chain(self, task_message: TaskMessage, result_data: ResultData) -> ResultMessage:
+    async def _handle_service_chain(self, task_message: TaskMessage, result_data: Data) -> ResultMessage | TaskMessage:
         """
         ОБРАБАТЫВАЕТ ЦЕПОЧКУ СЕРВИСОВ С ПРАВИЛЬНОЙ ОТПРАВКОЙ ВЕБХУКОВ
         """
@@ -232,31 +234,16 @@ class BaseService:
             # Есть следующие сервисы - передаем задачу дальше через RabbitMQ
             next_service = remaining_services[0]
             
-            new_message_id = uuid4()
             print(f"🔄 ⚙️ Chain: {self.service_name} -> {next_service}", file=sys.stderr)
-
-        
-            # ОБЪЕДИНЯЕМ ДАННЫЕ ОТ НАЧАЛЬНОЙ ЗАДАЧИ + ТО ЧТО ОТДАЛ СЕРВИС
-            next_input_data = task_message.data.input_data.copy()  # Копируем исходные данные
-            
-            if result_data.result:
-                next_input_data = {
-                    **task_message.data.input_data,  # Распаковываем исходные данные
-                    **result_data.result,            # Распаковываем результат текущего сервиса
-                }
 
 
             # Создаем новую задачу для следующего сервиса
             next_task = TaskMessage(
-                message_id=new_message_id,
+                message_id=uuid4(),
                 message_type=MessageType.TASK,
                 source_service=self.service_name,
                 target_services=remaining_services,
-                data=TaskData(
-                    task_type=task_message.data.task_type,                    
-                    input_data=next_input_data,
-                    parameters=task_message.data.parameters
-                )
+                data=result_data
             )
             
             # Отправляем через RabbitMQ
@@ -269,11 +256,9 @@ class BaseService:
                     source_service=self.service_name,
                     target_services=[task_message.source_service],
                     original_message_id=task_message.message_id,
-                    data=ResultData(
-                        success=False,
-                        error_message=f"Failed to send task to next service: {next_service}",
-                        execution_metadata={"service": self.service_name, "error": True}
-                    )
+                    success=False,
+                    error_message=f"Failed to send task to next service: {next_service}",
+                    data=result_data
                 )
             
             # Возвращаем промежуточный результат
@@ -283,9 +268,10 @@ class BaseService:
                 source_service=self.service_name,
                 target_services=[task_message.source_service],
                 original_message_id=task_message.message_id,
-                data=ResultData(
-                    success=True,
-                    result={"status": "passed_to_next_service", "next_service": next_service},
+                success=True,
+                data=Data(
+                    task_type=task_message.data.task_type if task_message.data else None,
+                    payload={"status": "passed_to_next_service", "next_service": next_service},
                     execution_metadata={"service": self.service_name, "chain_continued": True}
                 )
             )
@@ -295,21 +281,20 @@ class BaseService:
                 message_id=task_message.message_id,
                 message_type=MessageType.RESULT,
                 source_service=self.service_name,
-                target_services=None,
+                target_services=[],
                 original_message_id=task_message.message_id,
+                success=True if not result_data.payload_type == PayloadType.ERROR else False,
                 data=result_data
             )
             
             # Отправляем вебхук в wrapper
-            wrapper_callback_url = task_message.data.input_data.get("wrapper_callback_url")
+            wrapper_callback_url = task_message.data.wrapper_callback_url
             if wrapper_callback_url:
                 await self._send_webhook_to_wrapper(wrapper_callback_url, final_result)
                 print(f"📤 Final result sent to wrapper: {wrapper_callback_url}", file=sys.stderr)
             else:
                 print(f"⚠️ No wrapper_callback_url for final result", file=sys.stderr)
             
-            # Скорем результат от worker'a
-            final_result.data=ResultData(success = result_data.success)
             return final_result
         
     async def _send_webhook_to_wrapper(self, wrapper_url: str, result_message: ResultMessage):
@@ -367,7 +352,7 @@ class BaseService:
             self.processing_history[str(task_message.message_id)]["status"] = "completed"
             self.processing_history[str(task_message.message_id)]["result"] = result_data.model_dump()
             
-             
+                
             # Если цепочка продолжается, отправляем задачу следующему сервису
             if isinstance(next_message, TaskMessage):
                 await self._send_task_to_next_service(next_message)
@@ -377,18 +362,17 @@ class BaseService:
                     message_id=task_message.message_id,
                     message_type=MessageType.RESULT,
                     source_service=self.service_name,
-                    target_services=None,  # цепочка завершена
+                    target_services=[],  # цепочка завершена
                     original_message_id=task_message.message_id,
-                    data=ResultData(success = result_data.success)
+                    success=True if not result_data.payload_type == PayloadType.ERROR else False,
                 )
-                await self._send_webhook(callback_url, next_message)
-            else:
-                await self._send_webhook(callback_url, next_message)
+
+            await self._send_webhook(callback_url, next_message)
 
             
             processing_time = (time.time() - self.processing_start_time) * 1000
             print(f"✅ {self.service_name} background task completed in {processing_time:.2f}ms", file=sys.stderr)
-            
+                
         except Exception as e:
             print(f"❌ {self.service_name} background processing failed: {e}", file=sys.stderr)
             
@@ -397,9 +381,10 @@ class BaseService:
                 source_service=self.service_name,
                 target_services=task_message.target_services,
                 original_message_id=task_message.message_id,
-                data=ResultData(
-                    success=False,
-                    error_message=str(e),
+                success=False,
+                data=Data(
+                    payload_type = PayloadType.ERROR,
+                    payload={"text":str(e)}, #TODO ОГРАНИЧИТЬ ОТВЕТ ОШИБКИ
                     execution_metadata={"error": True, "service": self.service_name}
                 )
             )
@@ -464,7 +449,7 @@ class BaseService:
         
         if self.is_processing:
             status_info.update({
-                "current_task_id": str(self.current_task_id),
+                "current_task_id": self.current_task_id,
                 "processing_since": self.processing_start_time,
                 "processing_time_seconds": time.time() - self.processing_start_time if self.processing_start_time else 0
             })
@@ -492,7 +477,7 @@ class BaseService:
         """
         pass
     
-    async def _process_task_logic(self, task_message: TaskMessage) -> ResultData:
+    async def _process_task_logic(self, task_message: TaskMessage) -> Data:
         """
         Основная логика обработки задачи
         
@@ -500,7 +485,7 @@ class BaseService:
         """
         raise NotImplementedError("Дочерний класс должен реализовать этот метод")
     
-    async def _process_task_sync(self, task_message: TaskMessage) -> ResultData:
+    async def _process_task_sync(self, task_message: TaskMessage) -> Data:
         """Синхронная обработка задачи"""
         if self.is_processing:
             raise HTTPException(
@@ -523,27 +508,30 @@ class BaseService:
     
     async def _send_webhook(self, callback_url: str, result_message: ResultMessage):
         """Отправляет вебхук"""
-        try:
-            print(f"📤 {self.service_name} sending webhook to: {callback_url}", file=sys.stderr)
-            webhook_data = result_message.model_dump(mode='json')
+        if not callback_url:
+            print("❌ no send to webhook - no callback url")
+
+        #try:
+        print(f"📤 {self.service_name} sending webhook to: {callback_url}", file=sys.stderr)
+        json_body = result_message.model_dump(mode='json')
+        print(f" 🌍 {type(json_body)} ")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                callback_url,
+                json=json_body,
+                headers={"Content-Type": "application/json"}
+            )
             
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(
-                    callback_url,
-                    json=webhook_data,
-                    headers={"Content-Type": "application/json"}
-                )
-                
-                if response.status_code == 200:
-                    print(f"✅ {self.service_name} webhook delivered", file=sys.stderr)
-                    return True
-                else:
-                    print(f"⚠️ {self.service_name} webhook failed: {response.status_code}", file=sys.stderr)
-                    return False
+            if response.status_code == 200:
+                print(f"✅ {self.service_name} webhook delivered", file=sys.stderr)
+                return True
+            else:
+                print(f"⚠️ {self.service_name} webhook failed: {response.status_code}", file=sys.stderr)
+                return False
                     
-        except Exception as e:
-            print(f"❌ {self.service_name} webhook sending failed: {e}", file=sys.stderr)
-            return False
+        # except Exception as e:
+        #     print(f"❌ {self.service_name} webhook sending failed: {e}", file=sys.stderr)
+        #     return False
     
     def run(self, host: str = "0.0.0.0", port: int = 8000):
         """Запускает сервис"""

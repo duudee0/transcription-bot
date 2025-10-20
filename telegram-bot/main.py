@@ -7,7 +7,7 @@ from typing import Optional, Dict, Any, List, Set
 from contextlib import asynccontextmanager
 
 import httpx
-from aiogram import Bot, Dispatcher, Router, F
+from aiogram import Bot, Dispatcher, Router
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -53,10 +53,10 @@ class TaskStates(StatesGroup):
 # Используем MemoryStorage для FSM (в продакшене лучше Redis)
 storage = MemoryStorage()
 
-# Инициализируем бота с дефолтными настройками
+# Инициализируем бота
 bot = Bot(
     token=TELEGRAM_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)  # Автоматический HTML парсинг
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
 
 # Создаем диспетчер и роутер
@@ -65,7 +65,8 @@ router = Router()
 dp.include_router(router)
 
 # HTTP клиент для запросов к wrapper
-http_client = httpx.AsyncClient(timeout=30.0)
+# Создаем на уровне модуля — закроем в lifespan
+http_client: Optional[httpx.AsyncClient] = httpx.AsyncClient(timeout=30.0)
 
 # В памяти: map task_id -> list of chat_ids
 task_to_chats: Dict[str, List[int]] = {}
@@ -90,6 +91,35 @@ def make_main_keyboard() -> ReplyKeyboardMarkup:
     )
     return kb
 
+# --- Helpers to normalize wrapper response ---
+def _unwrap_wrapper_response(resp: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Приводит ответ клиента create_task_on_wrapper к телу (body) если он обёрнут:
+      - {"ok": True, "status_code": 200, "body": {...}}
+      - {...}  (прямое тело)
+      - текст / строка -> {"raw": "<text>"}
+    """
+    if not isinstance(resp, dict):
+        return {"raw": resp}
+    if "body" in resp:
+        body = resp["body"]
+        if isinstance(body, dict):
+            return body
+        else:
+            return {"raw": body}
+    # already a body dict
+    return resp if isinstance(resp, dict) else {"raw": resp}
+
+def _get_task_id_from_wrapper_response(resp: Dict[str, Any]) -> Optional[str]:
+    """Универсально извлекает task_id из разных форм ответов"""
+    body = _unwrap_wrapper_response(resp)
+    if isinstance(body, dict):
+        for key in ("task_id", "id", "taskId"):
+            if key in body and body[key]:
+                return str(body[key])
+    return None
+# --- end helpers ---
+
 async def create_task_on_wrapper(
     task_type: str,
     input_data: Dict[str, Any],
@@ -98,7 +128,11 @@ async def create_task_on_wrapper(
     timeout: int = 30,
     client_callback_url: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Создает задачу в wrapper и возвращает JSON-ответ"""
+    """
+    Создаёт задачу в wrapper и возвращает стандартную обёртку:
+      {"ok": bool, "status_code": int, "body": dict|str|null, "error": str|None}
+    """
+    global http_client
     payload = {
         "task_type": task_type,
         "input_data": input_data or {},
@@ -108,45 +142,96 @@ async def create_task_on_wrapper(
     if service_chain:
         payload["service_chain"] = service_chain
     if client_callback_url:
+        # wrapper ожидает поле "callback_url" в запросе от клиента
         payload["callback_url"] = client_callback_url
 
     url = f"{WRAPPER_URL.rstrip('/')}/api/v1/tasks"
-    logger.info("Posting task to wrapper: %s", url)
-    resp = await http_client.post(url, json=payload)
-    resp.raise_for_status()
-    return resp.json()
+    logger.info("Posting task to wrapper: %s (task_type=%s)", url, task_type)
 
-async def poll_task_result(task_id: str, timeout: int) -> Dict[str, Any]:
-    """Поллинг результата задачи с wrapper"""
+    try:
+        resp = await http_client.post(url, json=payload)
+    except Exception as e:
+        logger.exception("Network error posting to wrapper: %s", e)
+        return {"ok": False, "status_code": None, "body": None, "error": f"network_error: {e}"}
+
+    status = resp.status_code
+    body = None
+    try:
+        body = resp.json()
+    except Exception:
+        # если wrapper вернул не-json
+        try:
+            body = (await resp.aread()).decode(errors="ignore")
+        except Exception:
+            body = resp.text if hasattr(resp, "text") else None
+
+    if 200 <= status < 300:
+        logger.info("Wrapper returned %s: %s", status, body)
+        return {"ok": True, "status_code": status, "body": body, "error": None}
+    else:
+        logger.warning("Wrapper error %s: %s", status, body)
+        return {"ok": False, "status_code": status, "body": body, "error": f"wrapper_status_{status}"}
+
+async def poll_task_result(task_id: str, poll_timeout: int = 30) -> Dict[str, Any]:
+    """
+    Поллинг результата задачи с wrapper.
+    Возвращает словарь: {task_id, status, result, error}
+    """
+    global http_client
     url = f"{WRAPPER_URL.rstrip('/')}/api/v1/tasks/{task_id}"
     start = asyncio.get_event_loop().time()
     while True:
         try:
             resp = await http_client.get(url)
-            if resp.status_code == 200:
-                data = resp.json()
-                status = data.get("status")
-                if status in ("completed", "error", "timeout"):
-                    return data
-            else:
-                logger.warning("Wrapper returned %s for task %s", resp.status_code, task_id)
         except Exception as e:
-            logger.exception("Error while polling wrapper for task %s: %s", task_id, e)
-        if asyncio.get_event_loop().time() - start > timeout:
-            return {"task_id": task_id, "status": "timeout", "error": "local_poll_timeout", "result": None}
+            logger.warning("Error requesting wrapper status for %s: %s", task_id, e)
+            # короткий бэофф, потом повтор
+            await asyncio.sleep(POLL_INTERVAL)
+            if asyncio.get_event_loop().time() - start > poll_timeout:
+                return {"task_id": task_id, "status": "timeout", "result": None, "error": "network_error"}
+            continue
+
+        # parse
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+            except Exception:
+                logger.warning("Non-json response from wrapper for %s: %s", task_id, resp.text)
+                data = {"status": "unknown", "result": None}
+
+            status = data.get("status")
+            if status in ("completed", "error", "timeout"):
+                return {
+                    "task_id": task_id,
+                    "status": status,
+                    "result": data.get("result"),
+                    "error": data.get("error")
+                }
+            # still processing -> loop
+        else:
+            logger.warning("Wrapper returned %s for task %s", resp.status_code, task_id)
+
+        # timeout check
+        if asyncio.get_event_loop().time() - start > poll_timeout:
+            return {"task_id": task_id, "status": "timeout", "result": None, "error": "poll_timeout"}
+
         await asyncio.sleep(POLL_INTERVAL)
 
-# ---------- FastAPI эндпоинты (оставляем без изменений) ----------
+# ---------- FastAPI эндпоинты (lifespan и client webhook) ----------
 from fastapi import FastAPI, Request, HTTPException
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan для управления ресурсами FastAPI"""
-    # Startup
+    global http_client
     logger.info("Starting FastAPI application")
+    # ensure http_client exists
+    if http_client is None:
+        http_client = httpx.AsyncClient(timeout=30.0)
     yield
     # Shutdown
     await http_client.aclose()
+    http_client = None
     logger.info("FastAPI application shutdown")
 
 app = FastAPI(title="TG Wrapper Bot Server", lifespan=lifespan)
@@ -154,7 +239,8 @@ app = FastAPI(title="TG Wrapper Bot Server", lifespan=lifespan)
 @app.post("/client/webhook")
 async def client_webhook(request: Request):
     """
-    Эндпоинт для callback'ов от wrapper'а
+    Эндпоинт для callback'ов от wrapper'а (client callbacks).
+    Ожидаем тело: {"task_id": "...", "status": "...", "result": ..., "error": ...}
     """
     try:
         payload = await request.json()
@@ -173,47 +259,41 @@ async def client_webhook(request: Request):
 
     logger.info("Received client webhook for %s status=%s", task_id, status)
 
-    # Помечаем задачу как завершенную через вебхук
+    # Mark as completed (so poll fallback stops)
     completed_tasks.add(task_id)
 
-
-    # БЕЗОПАСНО отменяем задачу поллинга для этого task_id, если она существует
-    if task_id in polling_tasks:
-        polling_task = polling_tasks.pop(task_id)  # Используем pop для атомарного удаления
+    # cancel polling task if present (safe cancel)
+    polling_task = polling_tasks.pop(task_id, None)
+    if polling_task:
         if not polling_task.done():
             polling_task.cancel()
             try:
                 await polling_task
             except asyncio.CancelledError:
-                logger.info("Polling task for %s cancelled due to webhook", task_id)
+                logger.debug("Polling task cancelled for %s", task_id)
             except Exception as e:
                 logger.warning("Error while cancelling polling task for %s: %s", task_id, e)
-        else:
-            logger.info("Polling task for %s was already completed", task_id)
 
-    # Находим чаты, ожидающие этот task_id
+    # deliver message to mapped chats if any
     chats = task_to_chats.get(task_id, [])
     if not chats:
-        logger.warning("No chat mapping for task %s (webhook ignored)", task_id)
+        logger.info("No chat mapping for task %s (client webhook received)", task_id)
         return {"status": "no_mapping"}
 
-    # Формируем и отправляем сообщение каждому пользователю
-    text = f"📬 Результат задачи {task_id} (push from wrapper):\n\nStatus: {status}\n"
+    # prepare message text
+    text = f"📬 Результат задачи {task_id}:\nStatus: {status}\n"
     if error:
         text += f"Error: {error}\n"
     if result is not None:
         pretty = json.dumps(result, ensure_ascii=False, indent=2)
         pretty = _safe_truncate(pretty, 3500)
-        pretty_escaped = pretty
-        text += f"\nResult:\n<pre>{pretty_escaped}</pre>"
+        text += f"\nResult:\n<pre>{escape(pretty)}</pre>"
 
-    # Отправка с явным указанием parse_mode только когда используем HTML
+    # send messages asynchronously
     for chat_id in chats:
-        if "<pre>" in text:
-            asyncio.create_task(bot.send_message(chat_id, text, parse_mode=ParseMode.HTML))
-        else:
-            asyncio.create_task(bot.send_message(chat_id, text))
+        asyncio.create_task(bot.send_message(chat_id, text, parse_mode=ParseMode.HTML))
 
+    # store last webhook for the task
     task_meta.setdefault(task_id, {})["last_webhook"] = payload
     return {"status": "delivered"}
 
@@ -257,8 +337,9 @@ async def handle_test1(message: Message):
         await message.answer(f"Ошибка при создании задачи: {e}")
         return
 
-    task_id = resp.get("task_id")
+    task_id = _get_task_id_from_wrapper_response(resp)
     if not task_id:
+        logger.warning("Wrapper returned unexpected response while creating task: %s", resp)
         await message.answer(f"Wrapper ответил без task_id: {resp}")
         return
 
@@ -271,7 +352,6 @@ async def handle_test1(message: Message):
     polling_tasks[task_id] = polling_task
 
     await info_msg.edit_text("Тестовая задача отправлена. Ожидаю результат (вы получите push, когда wrapper пришлёт callback).")
-
 
 @router.message(Command("test2"))
 async def handle_test2(message: Message):
@@ -298,7 +378,7 @@ async def handle_test2(message: Message):
         await message.answer(f"Ошибка при создании задачи: {e}")
         return
 
-    task_id = resp.get("task_id")
+    task_id = _get_task_id_from_wrapper_response(resp)
     if not task_id:
         await message.answer(f"Wrapper ответил без task_id: {resp}")
         return
@@ -319,7 +399,7 @@ async def handle_task_command(message: Message, state: FSMContext):
     """
     await message.answer(
         "Давайте создадим задачу. Введите тип задачи (например, 'analyze_text'):",
-        reply_markup=ReplyKeyboardRemove()  # Убираем клавиатуру для чистого ввода
+        reply_markup=ReplyKeyboardRemove()
     )
     await state.set_state(TaskStates.waiting_for_task_type)
 
@@ -340,11 +420,7 @@ async def handle_input_data(message: Message, state: FSMContext):
         return
 
     await state.update_data(input_data=input_data)
-    
-    # Предлагаем ввести parameters или пропустить
-    await message.answer(
-        "Введите parameters в формате JSON (или отправьте 'skip' для пропуска):"
-    )
+    await message.answer("Введите parameters в формате JSON (или отправьте 'skip' для пропуска):")
     await state.set_state(TaskStates.waiting_for_parameters)
 
 @router.message(TaskStates.waiting_for_parameters)
@@ -377,7 +453,7 @@ async def handle_parameters(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    task_id = wrapper_resp.get("task_id")
+    task_id = _get_task_id_from_wrapper_response(wrapper_resp)
     if not task_id:
         await message.answer(f"Wrapper ответил без task_id: {wrapper_resp}")
         await state.clear()
@@ -427,7 +503,7 @@ async def poll_fallback(task_id: str, chat_id: int, timeout: int):
                 break
 
             try:
-                status_obj = await poll_task_result(task_id=task_id, timeout=5)  # Короткий таймаут для каждого запроса
+                status_obj = await poll_task_result(task_id=task_id, poll_timeout=5)  # короткий таймаут на итерацию
                 st = status_obj.get("status")
                 
                 if st == "completed":
@@ -495,12 +571,8 @@ async def cleanup_old_tasks():
     """Периодически очищает старые завершенные задачи чтобы избежать утечек памяти"""
     while True:
         await asyncio.sleep(3600)  # Каждый час
-        # Удаляем задачи, завершенные более 24 часов назад
-        # (здесь можно добавить логику с временными метками)
-        current_time = asyncio.get_event_loop().time()
         # Пока просто ограничим размер completed_tasks
         if len(completed_tasks) > 1000:
-            # Оставляем только последние 500 задач
             tasks_list = list(completed_tasks)
             for task_id in tasks_list[:-500]:
                 completed_tasks.discard(task_id)
@@ -537,7 +609,9 @@ async def main():
     finally:
         # Корректное завершение
         await bot.session.close()
-        await http_client.aclose()
+        global http_client
+        if http_client:
+            await http_client.aclose()
 
 if __name__ == "__main__":
     asyncio.run(main())

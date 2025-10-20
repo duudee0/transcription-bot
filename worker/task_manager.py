@@ -7,7 +7,7 @@ from aio_pika import IncomingMessage
 from typing import Dict, Any, Optional
 from dataclasses import dataclass
 
-from common.models import TaskMessage, ResultMessage, ResultData
+from common.models import PayloadType, TaskMessage, ResultMessage, Data
 
 logger = logging.getLogger("typed-worker.task-manager")
 
@@ -17,12 +17,12 @@ WORKER_NAME = os.getenv("WORKER_NAME", "generic-worker")
 # TODO: ОПРЕДЕЛИТЬСЯ КАК МЫ БУДЕМ РАСПРЕДЕЛЯТЬ ГОТОВЫЕ ОТВЕТЫ
 async def send_to_result_queue(result_message: ResultMessage):
     """Отправляет результат в очередь результатов (fallback)."""
-    logger.info(f"📤 Would send result to queue: {result_message.original_message_id}")
-    if result_message.data.success:
-        logger.info(f"✅ Task {result_message.original_message_id} completed successfully")
-    else:
-        logger.error(f"❌ Task {result_message.original_message_id} failed: {result_message.data.error_message}")
-
+    # logger.info(f"📤 Would send result to queue: {result_message.data.original_message_id}")
+    # if result_message.data.success:
+    #     logger.info(f"✅ Task {result_message.data.original_message_id} completed successfully")
+    # else:
+    #     logger.error(f"❌ Task {result_message.data.original_message_id} failed: {result_message.error_message}")
+    pass
 
 @dataclass
 class AsyncTaskState:
@@ -156,17 +156,17 @@ class AsyncTaskManager:
                     history_data = response.json()
                     if history_data.get("status") == "completed":
                         logger.info(f"🎉 Task {task_id} completed (via history)")
-                        await self._handle_task_completed(task_id, history_data.get("result", {}))
+                        await self._handle_task_completed(task_id, history_data)
                     elif history_data.get("status") == "failed":
                         logger.error(f"❌ Task {task_id} failed (via history)")
-                        await self._handle_task_failed(task_id, history_data.get("error_message", "Unknown error"))
+                        await self._handle_task_failed(task_id, history_data)
         except Exception as e:
             logger.warning(f"⚠️ History check failed for {task_id}: {e}", exc_info=True)
     
     # ----------------------------
     # Обработчики результатов (унифицированный поток публикации)
     # ----------------------------
-    async def _handle_task_completed(self, task_id: str, result_data: Dict):
+    async def _handle_task_completed(self, task_id: str, result_data: ResultMessage):
         """Обработка завершенной задачи"""
         task_state = self.active_tasks.get(task_id)
         if not task_state:
@@ -177,9 +177,11 @@ class AsyncTaskManager:
             source_service=WORKER_NAME,
             target_service=task_state.task.source_service,
             original_message_id=task_state.task.message_id,
-            data=ResultData(
-                success=True,
-                result=result_data,
+            success=True,
+            data=Data(
+                #task_type = result_data.get('data').get('task_type'),
+                payload_type = PayloadType.TEXT,
+                payload=result_data.data.payload,
                 execution_metadata={
                     "worker": WORKER_NAME,
                     "service": task_state.service_config["service_name"],
@@ -216,15 +218,8 @@ class AsyncTaskManager:
             source_service=WORKER_NAME,
             target_service=task_state.task.source_service,
             original_message_id=task_state.task.message_id,
-            data=ResultData(
-                success=False,
-                error_message=error,
-                execution_metadata={
-                    "worker": WORKER_NAME,
-                    "service": task_state.service_config["service_name"],
-                    "error": True
-                }
-            )
+            success=False,
+            error_message=error,
         )
 
         try:
@@ -256,15 +251,8 @@ class AsyncTaskManager:
             source_service=WORKER_NAME,
             target_service=task_state.task.source_service,
             original_message_id=task_state.task.message_id,
-            data=ResultData(
-                success=False,
-                error_message=f"Task timeout after {self.max_wait_time}s",
-                execution_metadata={
-                    "worker": WORKER_NAME,
-                    "service": task_state.service_config["service_name"],
-                    "timeout": True
-                }
-            )
+            success=False,
+            error_message=f"Task timeout after {self.max_wait_time}s",
         )
 
         try:
@@ -296,15 +284,8 @@ class AsyncTaskManager:
             source_service=WORKER_NAME,
             target_service=task_state.task.source_service,
             original_message_id=task_state.task.message_id,
-            data=ResultData(
-                success=False,
-                error_message=f"Service {task_state.service_config['service_name']} unavailable",
-                execution_metadata={
-                    "worker": WORKER_NAME,
-                    "service": task_state.service_config["service_name"],
-                    "service_down": True
-                }
-            )
+            success=False,
+            error_message=f"Service {task_state.service_config['service_name']} unavailable",
         )
 
         try:
@@ -353,12 +334,12 @@ class AsyncTaskManager:
     # ----------------------------
     # webhook handler (robust parsing)
     # ----------------------------
-    async def handle_webhook(self, message_id: str, payload: dict) -> bool:
+    async def handle_webhook(self, message_id: str, payload: ResultMessage) -> bool:
         """
         Обрабатывает вебхук уведомление.
         Поддерживает несколько форматов:
           - payload может содержать "original_message_id"
-          - payload может иметь вложенную структуру payload['data'] = {'success': True, 'result': {...}}
+          - payload может иметь вложенную структуру
           - payload может иметь поля success/status/result на верхнем уровне
         """
         # try to locate task_state by provided message_id (URL param)
@@ -369,7 +350,7 @@ class AsyncTaskManager:
             # try original_message_id in payload
             orig_id = None
             if isinstance(payload, dict):
-                orig_id = payload.get("original_message_id") or payload.get("message_id") or payload.get("data", {}).get("original_message_id")
+                orig_id = payload.get("message_id") or payload.get("data", {}).get("original_message_id")
             if orig_id:
                 task_state = self.active_tasks.get(str(orig_id))
 
@@ -382,41 +363,14 @@ class AsyncTaskManager:
         task_state.callback_received = True
         task_state.last_check = time.time()
 
-        # extract status & success & result robustly
-        # common shapes:
-        #   payload = {"data": {"success": True, "result": {...}}}
-        #   payload = {"success": true, "result": {...}}
-        #   payload = {"status": "completed", "result": {...}}
-        data_section = payload.get("data") if isinstance(payload, dict) else None
-
-        success_flag = None
-        status_field = None
-        result_obj = None
-        error_message = None
-
-        if isinstance(data_section, dict):
-            success_flag = data_section.get("success")
-            result_obj = data_section.get("result")
-            error_message = data_section.get("error_message") or data_section.get("error")
-            status_field = data_section.get("status")
-        # fallback to top-level
-        if success_flag is None:
-            success_flag = payload.get("success")
-        if result_obj is None:
-            result_obj = payload.get("result") or payload.get("data", {}).get("result")
-        if error_message is None:
-            error_message = payload.get("error_message") or payload.get("error")
-        if status_field is None:
-            status_field = payload.get("status")
-
         # interpret status
-        if status_field in ("completed", "done") or success_flag is True:
+        if payload.success == True:
             logger.info(f"✅ Webhook: task {task_id} completed")
-            await self._handle_task_completed(task_id, result_obj or {})
+            await self._handle_task_completed(task_id, payload)
             return True
-        elif status_field in ("failed", "error") or success_flag is False or error_message:
+        else:
             logger.error(f"❌ Webhook: task {task_id} failed")
-            await self._handle_task_failed(task_id, error_message or "Unknown error")
+            await self._handle_task_failed(task_id, payload.error_message or "Unknown error")
             return True
 
         # If webhook came but status unknown — keep callback_received true and let monitor poll history

@@ -23,7 +23,7 @@ import json
 T = TypeVar("T")
 
 
-class PayloadType(str, Enum):
+class CoreType(str, Enum):
     """
     Типы входных/выходных данных для контейнеров.
     Только самые основные.
@@ -33,7 +33,6 @@ class PayloadType(str, Enum):
     AUDIO = "audio"
     VIDEO = "video"
     FILE = "file"
-    ERROR = "error" # Ошибка и ее текст
 
 class MessageType(str, Enum):
     """
@@ -64,8 +63,11 @@ class BaseMessage(GenericModel, Generic[T]):
     source_service: str
     
     # Сервисы-получатели (опционально, для прямой маршрутизации)
-    target_services: List[str] = Field(default_factory=list)
+    target_services: Optional[List[str]] = None 
+    # Сервис-получатель (опционально, для прямой маршрутизации)
+    #target_service: Optional[str] = None
 
+    
     # Время создания сообщения (генерируется автоматически)
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     
@@ -75,37 +77,23 @@ class BaseMessage(GenericModel, Generic[T]):
     data: T
 
 
-class Data(BaseModel):
+class TaskData(BaseModel):
     """
-    ДАННЫЕ ЕДИНЫЕ И ДЛЯ ЗАДАЧИ И ДЛЯ ОТВЕТА НА НЕЕ
+    ДАННЫЕ ЗАДАЧИ
     
+    Содержит информацию о задаче, которую нужно выполнить.
     """
     # Тип задачи (определяет, какой воркер должен её обработать)
     task_type: Optional[str] = None  # Примеры: "process_image", "analyze_text", "generate_report"
     
-    # Что ожидать от payload (можно проверять в контейнере то ли пришло вообще)
-    payload_type: PayloadType = PayloadType.TEXT #пока что чтобы ошибки отлавливать 
-
     # Входные данные для задачи (произвольный словарь)
-    payload: Dict[str, Any] = Field(default_factory=dict)  # Пример: {"image_url": "http://...", "text": "Hello"}
-
-    # Чтобы вернуть конечный результат на вебхук wrapper
-    wrapper_callback_url: Optional[str] = None
-
-    # Вебхук на воркер чтобы сообщить ему что задача выполнена и он мог ее убрать из rabbit
-    callback_url: Optional[str] = None
-
-    # ID оригинального сообщения-задачи (возможно пригодится для защиты вебхуков)
-    original_message_id: Optional[UUID] = None
+    input_data: Dict[str, Any]  # Пример: {"image_url": "http://...", "text": "Hello"}
     
-    # Параметры выполнения задачи (настройки обработки) необходимо для следующих сервисов и для логирования
+    # Параметры выполнения задачи (настройки обработки)
     parameters: Dict[str, Any] = Field(default_factory=dict)  # Пример: {"quality": "high", "timeout": 30}
 
-    # Метаданные выполнения (время работы, используемые ресурсы, версия модели и т.д.) для ответа пользователю
-    execution_metadata: Dict[str, Any] = Field(default_factory=dict)  # Пример: {"processing_time_ms": 150, "memory_used_mb": 128}
 
-
-class TaskMessage(BaseMessage[Data]):
+class TaskMessage(BaseMessage[TaskData]):
     """
     СООБЩЕНИЕ-ЗАДАЧА
     
@@ -116,10 +104,29 @@ class TaskMessage(BaseMessage[Data]):
     message_type: MessageType = MessageType.TASK
     
     # Данные задачи для выполнения
-    data: Data
+    data: TaskData
 
 
-class ResultMessage(BaseMessage[Data]):
+class ResultData(BaseModel):
+    """
+    ДАННЫЕ РЕЗУЛЬТАТА
+    
+    Содержит результат выполнения задачи или информацию об ошибке.
+    """
+    # Флаг успешности выполнения
+    success: bool
+    
+    # Результат работы (если успешно)
+    result: Optional[Dict[str, Any]] = None  # Пример: {"processed_url": "http://...", "word_count": 42}
+    
+    # Сообщение об ошибке (если success = False)
+    error_message: Optional[str] = None
+    
+    # Метаданные выполнения (время работы, используемые ресурсы, версия модели и т.д.)
+    execution_metadata: Dict[str, Any] = Field(default_factory=dict)  # Пример: {"processing_time_ms": 150, "memory_used_mb": 128}
+
+
+class ResultMessage(BaseMessage[ResultData]):
     """
     СООБЩЕНИЕ-РЕЗУЛЬТАТ
     
@@ -130,14 +137,11 @@ class ResultMessage(BaseMessage[Data]):
     # Всегда имеет тип RESULT (переопределяем базовое поле)
     message_type: MessageType = MessageType.RESULT
     
+    # ID оригинального сообщения-задачи, на которое это ответ
+    original_message_id: UUID
+    
     # Данные результата выполнения
-    data: Optional[Data] = None
-
-    # Флаг успешности выполнения
-    success: bool = True # Если все норм то пускай так будет дефолт
-
-    # Сообщение об ошибке (если success = False)
-    error_message: Optional[str] = None
+    data: ResultData
 
 
 """

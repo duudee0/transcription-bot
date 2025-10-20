@@ -18,7 +18,7 @@ from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 
 # Общие модули
-from common.models import TaskMessage, ResultMessage, ResultData, MessageType
+from common.models import MessageType, PayloadType, TaskMessage, ResultMessage, Data
 from common.publisher import Publisher
 from common.service_config import get_service_url
 
@@ -193,41 +193,57 @@ async def process_task(task: TaskMessage, msg: IncomingMessage, service_config: 
         # Подготавливаем данные для следующего сервиса в цепочке (НОВАЯ ЛОГИКА)
         remaining_services = task.target_services[1:] if task.target_services else []
 
-        # Если есть следующие сервисы, готовим данные для цепочки
-        enhanced_input_data = {
-            **task.data.input_data,
-            "callback_url": f"http://{WORKER_HOST}:{WORKER_PORT}/webhook/{task.message_id}",
+        # Build enhanced Data dict (we use Data.model_dump to keep compatibility)
+        # Ensure payload exists
+        payload = task.data.payload if (task.data and isinstance(task.data.payload, dict)) else {}
+
+        # add worker webhook as callback so target service can notify us
+        worker_callback = f"http://{WORKER_HOST}:{WORKER_PORT}/webhook/{task.message_id}"
+
+        # prefer task.data.callback_url if present — keep both
+        enhanced_payload = {**payload}
+
+        # pass callback (where worker expects to get results for this message)
+        # We store worker callback in data.callback_url so target service can call it.
+        enhanced_data_dict = task.data.model_dump() if hasattr(task.data, "model_dump") else {}
+
+        # override callback_url to worker webhook (so service will post back to worker)
+        enhanced_data_dict["callback_url"] = worker_callback
+
+        # Keep wrapper_callback_url if present
+        # ensure payload updated
+        enhanced_data_dict["payload"] = enhanced_payload
+
+        # If chain remains, set target_services for new Task to [service_name] + remaining
+        new_target_services = [service_name] + remaining_services if remaining_services else [service_name]
+
+        # Build new full task payload for HTTP (we can reuse Pydantic dump)
+        enhanced_task_dict = {
+            **task.model_dump(),  # base message fields as dict
+            "data": enhanced_data_dict,
+            "target_services": new_target_services
         }
-        
-        # Если есть цепочка, передаем оставшиеся сервисы
-        enhanced_task_data = {
-            **task.data.model_dump(),
-            "input_data": enhanced_input_data
-        }
-        
-        # Создаем enhanced task с обновленными target_services если есть цепочка
-        enhanced_task = TaskMessage(
-            **{
-                **task.model_dump(),
-                "data": enhanced_task_data,
-                "target_services": [service_name] + remaining_services if remaining_services else None
-            }
-        )
+
+        # Validate/construct enhanced TaskMessage to ensure consistency
+        try:
+            enhanced_task = TaskMessage.model_validate(enhanced_task_dict)
+        except Exception:
+            # Fallback: send raw dict if model validation fails
+            enhanced_task = enhanced_task_dict
         
         service_result = await send_via_http(target_url, enhanced_task.model_dump())
 
         # ОБРАБОТКА РЕЗУЛЬТАТА
         if "error" in service_result:
             logger.error(f"❌ HTTP request failed to {service_name}: {service_result['error']}")
+            # Build failure ResultMessage back to caller (task.source_service)
             return ResultMessage(
-                source_service=WORKER_NAME,
-                target_services=[task.source_service],
-                original_message_id=task.message_id,
-                data=ResultData(
-                    success=False,
-                    error_message=service_result["error"],
-                    execution_metadata={"worker": WORKER_NAME, "service": service_name}
-                )
+                message_id = uuid4(),
+                message_type = MessageType.RESULT,
+                source_service = WORKER_NAME,
+                target_services = [task.source_service] if task.source_service else [],
+                success = False,
+                error_message = service_result["error"]
             )
         
         status_code = int(service_result.get("status_code", 0))
@@ -239,11 +255,8 @@ async def process_task(task: TaskMessage, msg: IncomingMessage, service_config: 
                 source_service=WORKER_NAME,
                 target_service=task.source_service,
                 original_message_id=task.message_id,
-                data=ResultData(
-                    success=False,
-                    error_message=f"Service returned status {status_code}",
-                    execution_metadata={"worker": WORKER_NAME, "service": service_name}
-                )
+                success = False,
+                error_message = f"Service returned status {status_code}",
             )
         
         logger.info(f"⚙️ HTTP request to {service_name}: {str(status_code)}")
@@ -264,11 +277,8 @@ async def process_task(task: TaskMessage, msg: IncomingMessage, service_config: 
             source_service=WORKER_NAME,
             target_services=[task.source_service] if task else ["unknown"],
             original_message_id=task.message_id if task else uuid4(),
-            data=ResultData(
-                success=False,
-                error_message=f"Unexpected processing error: {str(e)}",
-                execution_metadata={"worker": WORKER_NAME, "error": True}
-            )
+            success=False,
+            error_message=f"Unexpected processing error: {str(e)}",
         )
 
 async def handle_message(msg: IncomingMessage, publisher: Publisher):
@@ -294,11 +304,8 @@ async def handle_message(msg: IncomingMessage, publisher: Publisher):
                 source_service=WORKER_NAME,
                 target_services=[task_message.source_service],
                 original_message_id=task_message.message_id,
-                data=ResultData(
-                    success=False,
-                    error_message=error_msg,
-                    execution_metadata={"worker": WORKER_NAME, "error": True}
-                )
+                success=False,
+                error_message=error_msg,
             )
 
             
@@ -326,11 +333,8 @@ async def handle_message(msg: IncomingMessage, publisher: Publisher):
                     source_service=WORKER_NAME,
                     target_services=[task_message.source_service],
                     original_message_id=task_message.message_id,
-                    data=ResultData(
-                        success=False,
-                        error_message=f"Service {service_name} unavailable after {attempts} attempts",
-                        execution_metadata={"worker": WORKER_NAME, "service": service_name, "retries": attempts}
-                    )
+                    success=False,
+                    error_message=f"Service {service_name} unavailable after {attempts} attempts",
                 )
                 # используем publisher чтобы отправить result
                 # Попытаемся опубликовать результат, но ошибка публикации не должна
@@ -387,8 +391,10 @@ async def handle_message(msg: IncomingMessage, publisher: Publisher):
 async def webhook_handler(message_id: str, request: Request):
     """Обрабатывает вебхук уведомления от сервисов"""
     try:
-        payload = await request.json()
-        logger.info(f"📬 Webhook received for {message_id}: {payload.get('data').get('success', 'None success')}")
+        req = await request.json()
+        logger.info(f"📥 Raw webhook request body for {message_id}: {req}")
+        payload: ResultMessage = ResultMessage.model_validate(req) 
+        logger.info(f"📬 Webhook received for {message_id}: {payload.success}")
         
         # Передаем в менеджер задач
         processed = await task_manager.handle_webhook(message_id, payload)

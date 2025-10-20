@@ -1,3 +1,4 @@
+import functools
 import os
 import asyncio
 import logging
@@ -135,7 +136,9 @@ class Publisher:
             if asyncio.iscoroutinefunction(self._upload_hook):
                 url = await self._upload_hook(body)
             else:
-                url = self._upload_hook(body)
+                loop = asyncio.get_running_loop()
+                url = await loop.run_in_executor(None, functools.partial(self._upload_hook, body))
+            
             pointer = {"claim_check": True, "url": url, "original_size": len(body)}
             return (json.dumps(pointer).encode(), True)
         return body, False
@@ -157,7 +160,15 @@ class Publisher:
             ch = await self._ensure_channel()
             body_to_send, cc = await self._maybe_claim_check(body)
             msg_headers = dict(headers or {})
-            msg = Message(body_to_send, headers=msg_headers, delivery_mode=DeliveryMode.PERSISTENT)
+            msg = Message(
+                body_to_send,
+                headers=msg_headers,
+                delivery_mode=DeliveryMode.PERSISTENT,
+                content_type="application/json",
+                message_id=msg_headers.get("message_id") or None,
+                correlation_id=msg_headers.get("correlation_id") or None
+            )
+
             if priority is not None:
                 try:
                     msg.priority = int(priority)
@@ -174,7 +185,7 @@ class Publisher:
                     logger.debug("Published message -> %s (bytes=%d claim_check=%s headers=%s)",
                                  routing_key, len(body_to_send), cc, list(msg_headers.keys()))
                     return
-                except AMQPError as e:
+                except Exception as e:
                     attempt += 1
                     self.metrics["publish_retry"] += 1
                     logger.warning("Publish attempt %d failed to %s: %s", attempt, routing_key, e)
