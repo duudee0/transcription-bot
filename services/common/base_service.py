@@ -243,7 +243,17 @@ class BaseService:
                 message_type=MessageType.TASK,
                 source_service=self.service_name,
                 target_services=remaining_services,
-                data=result_data
+                data= Data(
+                    task_type=task_message.data.task_type,
+                    payload_type=task_message.data.payload_type,
+                    payload=result_data.payload,
+                    wrapper_callback_url=task_message.data.wrapper_callback_url,
+                    original_message_id=task_message.data.original_message_id,
+                    parameters=task_message.data.parameters,
+                    execution_metadata={**task_message.data.execution_metadata, 
+                                        **result_data.execution_metadata}
+                    #callback_url=None
+                )
             )
             
             # Отправляем через RabbitMQ
@@ -511,27 +521,27 @@ class BaseService:
         if not callback_url:
             print("❌ no send to webhook - no callback url")
 
-        #try:
-        print(f"📤 {self.service_name} sending webhook to: {callback_url}", file=sys.stderr)
-        json_body = result_message.model_dump(mode='json')
-        print(f" 🌍 {type(json_body)} ")
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                callback_url,
-                json=json_body,
-                headers={"Content-Type": "application/json"}
-            )
-            
-            if response.status_code == 200:
-                print(f"✅ {self.service_name} webhook delivered", file=sys.stderr)
-                return True
-            else:
-                print(f"⚠️ {self.service_name} webhook failed: {response.status_code}", file=sys.stderr)
-                return False
-                    
-        # except Exception as e:
-        #     print(f"❌ {self.service_name} webhook sending failed: {e}", file=sys.stderr)
-        #     return False
+        try:
+            print(f"📤 {self.service_name} sending webhook to: {callback_url}", file=sys.stderr)
+            json_body = result_message.model_dump(mode='json')
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    callback_url,
+                    json=json_body,
+                    headers={"Content-Type": "application/json"}
+                )
+                
+                if response.status_code == 200:
+                    print(f"✅ {self.service_name} webhook delivered", file=sys.stderr)
+                    return True
+                else:
+                    print(f"⚠️ {self.service_name} webhook failed: {response.status_code}", file=sys.stderr)
+                    return False
+                        
+        except Exception as e:
+            print(f"❌ {self.service_name} webhook sending failed: {e}", file=sys.stderr)
+            return False
     
     def run(self, host: str = "0.0.0.0", port: int = 8000):
         """Запускает сервис"""

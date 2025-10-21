@@ -37,7 +37,7 @@ services:
   gigachat-service:
     build:
       context: ./
-      dockerfile: models/gigachat/Dockerfile
+      dockerfile: services/gigachat/Dockerfile
     environment:
       - PORT=8000
       - GIGACHAT_TOKEN=${GIGACHAT_TOKEN}
@@ -53,7 +53,7 @@ services:
   llm-service:
     build:
       context: ./
-      dockerfile: models/testing/Dockerfile
+      dockerfile: services/testing/Dockerfile
     environment:
       - PORT=8000
     ports:

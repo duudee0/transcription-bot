@@ -392,7 +392,7 @@ async def webhook_handler(message_id: str, request: Request):
     """Обрабатывает вебхук уведомления от сервисов"""
     try:
         req = await request.json()
-        logger.info(f"📥 Raw webhook request body for {message_id}: {req}")
+        logger.info(f"📥 Raw webhook request body for {message_id}")
         payload: ResultMessage = ResultMessage.model_validate(req) 
         logger.info(f"📬 Webhook received for {message_id}: {payload.success}")
         

@@ -6,10 +6,10 @@ ENV PYTHONUNBUFFERED=1
 COPY common/models.py /app/common/models.py
 COPY common/publisher.py /app/common/publisher.py
 
-COPY models/common /app/common
+COPY services/common /app/common
 
 # Копируем общие модели
-COPY models/testing /app
+COPY services/testing /app
 
 RUN pip install --no-cache-dir -r requirements.txt
 

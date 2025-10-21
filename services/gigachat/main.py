@@ -30,15 +30,6 @@ class GigaChatService(BaseService):
         ]
         return task_type in supported_task_types
     
-    async def _validate_task(self, task_message: TaskMessage):
-        """Валидация задачи для сервиса"""
-        # Теперь используем _can_handle_task_type для валидации
-        # if not self._can_handle_task_type(task_message.data.task_type):
-        #     raise HTTPException(
-        #         status_code=400,
-        #         detail=f"LLM service does not support task type: {task_message.data.task_type}"
-        #     )
-        pass
 
     #TODO воркер не видел если не было токена надо исправить
     async def _health_handler(self):
@@ -65,14 +56,14 @@ class GigaChatService(BaseService):
         #     )
         
         # Проверяем наличие промпта
-        prompt = task_message.data.input_data.get("prompt", "")
+        prompt = task_message.data.payload.get("text", "")
         if not prompt:
             raise HTTPException(status_code=500, detail=f"Prompt is required for generate_response task")
     # TODO воркер не хочет нормально обрабатывать ошибки
 
     async def _process_task_logic(self, task_message: TaskMessage) -> Data:
         """Логика обработки задачи через GigaChat"""
-        prompt = task_message.data.input_data.get("prompt", "")
+        prompt = task_message.data.payload.get("text", "")
         
         # Вызываем GigaChat
         response = await self._call_gigachat(prompt)
