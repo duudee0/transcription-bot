@@ -110,6 +110,8 @@ SERVICE_CONFIGS = {
     "generate_response": {"service_name": "gigachat-service"},
     "analyze_text": {"service_name": "llm-service"},
     "process_image": {"service_name": "image-service"},
+    "local-llm": {"service_name": "local-llm"},
+    "llm-service": {"service_name": "llm-service"},
 }
 
 class TaskRequest(BaseModel):

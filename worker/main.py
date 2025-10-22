@@ -375,9 +375,9 @@ async def handle_message(msg: IncomingMessage, publisher: Publisher):
 
         # Обработка ошибок
         if result_message:
-            if result_message.data.error_message:
+            if result_message.error_message:
                 #TODO СДЕЛАТЬ ОБРАБОТКУ ОШИБОК
-                logger.error(f"❌ 'error' in result_message: {result_message.data.error_message}")
+                logger.error(f"❌ 'error' in result_message: {result_message.error_message}")
                 await msg.ack() # В парашу его не рабочее
 
                 

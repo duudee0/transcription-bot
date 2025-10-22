@@ -50,6 +50,39 @@ services:
       - internal
 
 
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 4G
+    networks:
+      - ollama
+      
+  local-llm:
+    build:
+      context: ./
+      dockerfile: services/local-llm/Dockerfile
+    ports:
+      - "8004:8000"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - LOCAL_MODEL=llama2:7b  # Модель по умолчанию
+    command: sh -c "sleep 7 && exec python main.py"
+    depends_on:
+      - ollama
+    networks:
+      - internal
+      - ollama
+
   llm-service:
     build:
       context: ./
@@ -151,6 +184,8 @@ services:
 networks:
   frontend:
   internal:
+  ollama:
 
 volumes:
   pgdata:
+  ollama_data: {}

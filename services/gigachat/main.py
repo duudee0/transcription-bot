@@ -31,7 +31,6 @@ class GigaChatService(BaseService):
         return task_type in supported_task_types
     
 
-    #TODO воркер не видел если не было токена надо исправить
     async def _health_handler(self):
         """Переопределяем health handler для проверки токена"""
         status = "ok" if self.gigachat_token else "no_token"
@@ -49,11 +48,11 @@ class GigaChatService(BaseService):
             raise HTTPException(status_code=500, detail="GIGACHAT_TOKEN not configured")
         
         # Проверяем тип задачи
-        # if task_message.data.task_type != "generate_response":
-        #     raise HTTPException(
-        #         status_code=400, 
-        #         detail=f"Unsupported task type: {task_message.data.task_type}. Only 'generate_response' is supported"
-        #     )
+        if task_message.data.payload_type != PayloadType.TEXT:
+            raise HTTPException( # Этот сервис ожидает текстовый запрос
+                status_code=400, 
+                detail=f"Unsupported task type: {task_message.data.payload_type}. Only 'generate_response' is supported"
+            )
         
         # Проверяем наличие промпта
         prompt = task_message.data.payload.get("text", "")

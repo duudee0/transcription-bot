@@ -27,13 +27,12 @@ class LLMService(BaseService):
     
     async def _validate_task(self, task_message: TaskMessage):
         """Валидация задачи для LLM сервиса"""
-        # Теперь используем _can_handle_task_type для валидации
-        # if not self._can_handle_task_type(task_message.data.task_type):
-        #     raise HTTPException(
-        #         status_code=400,
-        #         detail=f"LLM service does not support task type: {task_message.data.task_type}"
-        #     )
-        pass
+        # Проверяем тип задачи
+        if task_message.data.payload_type != PayloadType.TEXT:
+            raise HTTPException( # Этот сервис ожидает текстовый запрос
+                status_code=400, 
+                detail=f"Unsupported task type: {task_message.data.payload_type}. Only is supported"
+            )
     
     async def _process_task_logic(self, task_message: TaskMessage) -> Data:
         """Логика обработки задачи для LLM сервиса"""
@@ -70,7 +69,7 @@ class LLMService(BaseService):
         
         prompt = f"{text} \nin this is text word:{len(words)}"
 
-        return {  #TODO НЕ возвращаются данные почему то
+        return {
             "task": "text_analysis",
             "word_count": len(words),
             "text": prompt,
