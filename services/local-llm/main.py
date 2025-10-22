@@ -1,3 +1,5 @@
+import asyncio
+import aiohttp
 from common.base_service import BaseService
 from common.models import PayloadType, TaskMessage, Data
 from fastapi import HTTPException
@@ -16,7 +18,31 @@ class LocalModelService(BaseService):
         self.ollama_host = os.getenv("OLLAMA_HOST", "http://ollama:11434")
         self.model_name = os.getenv("LOCAL_MODEL", "llama2")  # или "mistral", "codellama" и т.д.
         self.timeout = int(os.getenv("MODEL_TIMEOUT", "120"))
+        # Сессия aiohttp
+        self.session = None
 
+    async def get_session(self) -> aiohttp.ClientSession:
+        """Получаем или создаем сессию aiohttp"""
+        if self.session is None:
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            self.session = aiohttp.ClientSession(timeout=timeout)
+        return self.session
+
+    async def close_session(self):
+        """Закрываем сессию при завершении"""
+        if self.session:
+            await self.session.close()
+            self.session = None
+
+    def _can_handle_task_type(self, task_type: str) -> bool:
+        """Определяет, может ли сервис обработать тип задачи"""
+        supported_task_types = [
+            "generate_response", 
+            "text_generation",
+            "code_generation"
+        ]
+        return task_type in supported_task_types
+    
     def _can_handle_task_type(self, task_type: str) -> bool:
         """Определяет, может ли сервис обработать тип задачи"""
         supported_task_types = [
@@ -35,23 +61,23 @@ class LocalModelService(BaseService):
             
             print(f' ❔ Access ollama: {models_available}')
 
-            # Проверяем, загружена ли наша модель
-            if models_available:
-                models_data = response.json()
-                model_loaded = any(self.model_name in model['name'] for model in models_data.get('models', []))
-            else:
-                model_loaded = False
+            # # Проверяем, загружена ли наша модель
+            # if models_available:
+            #     models_data = response.json()
+            #     model_loaded = any(self.model_name in model['name'] for model in models_data.get('models', []))
+            # else:
+            #     model_loaded = False
             
-            print(f' ❔ Is busy ollama: {models_available}')
+            # print(f' ❔ Is busy ollama: {models_available}')
 
-            status = "ok" if models_available and model_loaded else "unhealthy"
+            status = "ok" if models_available else "unhealthy"
             
             return {
                 "status": status,
                 "service": self.service_name,
                 "model": self.model_name,
                 "ollama_available": models_available,
-                "model_loaded": model_loaded,
+                #"model_loaded": model_loaded,
                 "host": self.ollama_host
             }
         except Exception as e:
@@ -104,10 +130,13 @@ class LocalModelService(BaseService):
         )
     
     async def _call_local_model(self, prompt: str, max_tokens: int, temperature: float) -> str:
-        try:
-            url = f"{self.ollama_host}/api/generate"  # URL контейнера с Ollama
+        """Асинхронный вызов локальной модели"""
+        try: #TODO Переделать на httpx!
+            session = await self.get_session()
+            url = f"{self.ollama_host}/api/generate"
+            
             payload = {
-                "model": self.model_name,  # Например, "llama2:7b"
+                "model": self.model_name,
                 "prompt": prompt,
                 "stream": False,
                 "options": {
@@ -115,13 +144,32 @@ class LocalModelService(BaseService):
                     "temperature": temperature
                 }
             }
-            response = requests.post(url, json=payload)
-            response.raise_for_status()
-            result = response.json()
-            return result.get("response", "").strip()
-        except requests.exceptions.RequestException as e:
-            raise HTTPException(status_code=503, detail=f"Ollama service unavailable: {str(e)}")
+            
+            async with session.post(url, json=payload) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    raise HTTPException(
+                        status_code=503, 
+                        detail=f"Ollama API error: {error_text}"
+                    )
+                
+                result = await response.json()
+                return result.get("response", "").strip()
+                
+        except aiohttp.ClientError as e:
+            raise HTTPException(
+                status_code=503, 
+                detail=f"Ollama service unavailable: {str(e)}"
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail="Ollama request timeout"
+            )
 
+    async def __del__(self):
+        """Деструктор для закрытия сессии"""
+        await self.close_session()
 # Создаем и запускаем сервис
 service = LocalModelService()
 

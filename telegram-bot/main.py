@@ -312,12 +312,59 @@ async def handle_start(message: Message):
     )
     await message.answer(txt, reply_markup=make_main_keyboard(), parse_mode='HTML')
 
+@router.message(Command("ollama"))
+async def handle_test1(message: Message):
+    """Обработчик текста который шлется в ламу"""
+
+    request = message.text.removeprefix("/ollama")
+    if not request:
+        await message.answer(f"Вы не передали команде запрос!")
+        return
+    
+    chat_id = message.chat.id
+    task_type = "local-llm"
+    input_data = {"text": request, "language": "ru"}
+    parameters = {"detailed_analysis": True}
+    service_chain = ["local-llm"]
+
+    info_msg = await message.answer("Передаю ламе ваш запрос...")
+    
+    try:
+        resp = await create_task_on_wrapper(
+            task_type=task_type,
+            input_data=input_data,
+            parameters=parameters,
+            service_chain=service_chain,
+            timeout=GLOBAL_TIMEOUT,
+            client_callback_url=CLIENT_CALLBACK_URL_FOR_WRAPPER
+        )
+    except Exception as e:
+        logger.exception("Failed to create test1 task: %s", e)
+        await message.answer(f"Ошибка при создании задачи: {e}")
+        return
+
+    task_id = _get_task_id_from_wrapper_response(resp)
+    if not task_id:
+        logger.warning("Wrapper returned unexpected response while creating task: %s", resp)
+        await message.answer(f"Wrapper ответил без task_id: {resp}")
+        return
+
+    # Сохраняем mapping task->chat
+    task_to_chats.setdefault(task_id, []).append(chat_id)
+    task_meta.setdefault(task_id, {}).update({"type": task_type, "created_by": chat_id})
+
+    # Запускаем polling fallback и сохраняем ссылку на задачу
+    polling_task = asyncio.create_task(poll_fallback(task_id, chat_id, GLOBAL_TIMEOUT))
+    polling_tasks[task_id] = polling_task
+
+    await info_msg.edit_text("Тестовая задача отправлена. Ожидаю результат (вы получите push, когда wrapper пришлёт callback).")
+
 @router.message(Command("test1"))
 async def handle_test1(message: Message):
     """Обработчик тестовой задачи 1 - анализ текста"""
     chat_id = message.chat.id
     task_type = "analyze_text"
-    input_data = {"text": "Это тест от Telegram-бота: проверьте работу анализа текста.", "language": "ru"}
+    input_data = {"text": message.text, "language": "ru"}
     parameters = {"detailed_analysis": True}
     service_chain = ["llm-service"]
 

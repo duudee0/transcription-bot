@@ -355,7 +355,7 @@ class AsyncTaskManager:
                 task_state = self.active_tasks.get(str(orig_id))
 
         if not task_state:
-            logger.warning(f"🤔 Webhook for unknown task: {message_id} (payload keys: {list(payload.keys())})")
+            logger.warning(f"🤔 Webhook for unknown task: {message_id} (payload keys: {list(payload)})")
             return False
 
         # mark callback received
