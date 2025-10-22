@@ -292,6 +292,8 @@ async def client_webhook(request: Request):
     # send messages asynchronously
     for chat_id in chats:
         asyncio.create_task(bot.send_message(chat_id, text, parse_mode=ParseMode.HTML))
+        asyncio.create_task(bot.send_message(chat_id, f"🩷 Ответ: \r\n{result.get("text", "non text")}", 
+                                             parse_mode=ParseMode.HTML))
 
     # store last webhook for the task
     task_meta.setdefault(task_id, {})["last_webhook"] = payload
@@ -328,6 +330,53 @@ async def handle_test1(message: Message):
     service_chain = ["local-llm"]
 
     info_msg = await message.answer("Передаю ламе ваш запрос...")
+    
+    try:
+        resp = await create_task_on_wrapper(
+            task_type=task_type,
+            input_data=input_data,
+            parameters=parameters,
+            service_chain=service_chain,
+            timeout=GLOBAL_TIMEOUT,
+            client_callback_url=CLIENT_CALLBACK_URL_FOR_WRAPPER
+        )
+    except Exception as e:
+        logger.exception("Failed to create test1 task: %s", e)
+        await message.answer(f"Ошибка при создании задачи: {e}")
+        return
+
+    task_id = _get_task_id_from_wrapper_response(resp)
+    if not task_id:
+        logger.warning("Wrapper returned unexpected response while creating task: %s", resp)
+        await message.answer(f"Wrapper ответил без task_id: {resp}")
+        return
+
+    # Сохраняем mapping task->chat
+    task_to_chats.setdefault(task_id, []).append(chat_id)
+    task_meta.setdefault(task_id, {}).update({"type": task_type, "created_by": chat_id})
+
+    # Запускаем polling fallback и сохраняем ссылку на задачу
+    polling_task = asyncio.create_task(poll_fallback(task_id, chat_id, GLOBAL_TIMEOUT))
+    polling_tasks[task_id] = polling_task
+
+    await info_msg.edit_text("Тестовая задача отправлена. Ожидаю результат (вы получите push, когда wrapper пришлёт callback).")
+
+@router.message(Command("ollama2"))
+async def handle_test1(message: Message):
+    """Обработчик текста который шлется в ламу"""
+
+    request = message.text.removeprefix("/ollama2")
+    if not request:
+        await message.answer(f"Вы не передали команде запрос!")
+        return
+    
+    chat_id = message.chat.id
+    task_type = "local-llm"
+    input_data = {"text": request, "language": "ru"}
+    parameters = {"detailed_analysis": True}
+    service_chain = ["local-llm", "llm-service"]
+
+    info_msg = await message.answer("Передаю ламе и тестовому контейнеру ваш запрос...")
     
     try:
         resp = await create_task_on_wrapper(
