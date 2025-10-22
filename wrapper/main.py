@@ -11,7 +11,9 @@ import httpx
 from datetime import datetime
 import logging
 from contextlib import asynccontextmanager
+import secrets
 
+from common.models import PayloadType, Data, TaskMessage, ResultMessage, MessageType
 from common.models import TaskMessage, ResultMessage, Data ,MessageType
 from common.publisher import Publisher
 from common.service_config import get_service_url
@@ -24,8 +26,23 @@ WRAPPER_HOST_DOCKER = "wrapper"  # Имя контейнера в Docker сет�
 # Глобальный publisher
 publisher = None
 
-# Задачи, которые должны проходить через несколько сервисов (последовательно)
+logger = logging.getLogger("wrapper")
+logging.basicConfig(level=logging.INFO)
+
+# In-memory хранилище (в продакшене заменить на Redis)
+task_store = {}
+
 #TODO: ПОКА ЧТО ХАРДКОД ТАК УДОБНЕЕ ТЕСТИРОВАТЬ А ВООБЩЕ ДОБАВИТЬ НОРМ API ДЛЯ ТАКОГО
+# Конфигурация сервисов (аналогично воркеру)
+SERVICE_CONFIGS = {
+    "generate_response": {"service_name": "gigachat-service"},
+    "analyze_text": {"service_name": "llm-service"},
+    "process_image": {"service_name": "image-service"},
+    "local-llm": {"service_name": "local-llm"},
+    "llm-service": {"service_name": "llm-service"},
+}
+# Задачи, которые должны проходить через несколько сервисов (последовательно)
+
 MULTI_SERVICE_CHAINS = {
     "comprehensive_analysis": ["llm-service", "gigachat-service"],
     "text_to_speech": ["llm-service", "voice-service"], 
@@ -40,8 +57,6 @@ MULTI_SERVICE_CHAINS = {
 
 """
 
-import secrets
-from common.models import PayloadType, Data, TaskMessage, ResultMessage, MessageType
 
 def infer_payload_type(payload: Dict[str, Any]) -> PayloadType:
     """Простая эвристика для определения payload_type."""
@@ -99,20 +114,6 @@ app = FastAPI(
     lifespan=lifespan  # Используем современный lifespan
 )
 
-logger = logging.getLogger("wrapper")
-logging.basicConfig(level=logging.INFO)
-
-# In-memory хранилище (в продакшене заменить на Redis)
-task_store = {}
-
-# Конфигурация сервисов (аналогично воркеру)
-SERVICE_CONFIGS = {
-    "generate_response": {"service_name": "gigachat-service"},
-    "analyze_text": {"service_name": "llm-service"},
-    "process_image": {"service_name": "image-service"},
-    "local-llm": {"service_name": "local-llm"},
-    "llm-service": {"service_name": "llm-service"},
-}
 
 class TaskRequest(BaseModel):
     """Упрощенный запрос от клиента"""
@@ -236,6 +237,7 @@ async def get_task_status(task_id: str):
     if task_id not in task_store:
         raise HTTPException(status_code=404, detail="Task not found")
     
+    #TODO РЕАЛИЗОВАТЬ КЭШ ПАМЯТЬ С ОПРОСОМ RABBITMQ (?WORKER)
     task = task_store[task_id]
     return StatusResponse(
         task_id=task_id,
@@ -252,13 +254,13 @@ async def handle_webhook(task_id: str, secret: str, request: Request):
        URL contains secret token that wrapper issued when task created."""
     try:
         if task_id not in task_store:
-            logger.warning(f"Webhook for unknown task: {task_id}")
+            logger.warning(f"⚠️ Webhook for unknown task: {task_id}")
             raise HTTPException(status_code=404, detail="Task not found")
 
         stored = task_store[task_id]
         expected = stored.get("webhook_secret")
         if not expected or secret != expected:
-            logger.warning(f"Invalid webhook secret for task {task_id}")
+            logger.warning(f"⛔ Invalid webhook secret for task {task_id}")
             raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
         payload = await request.json()
@@ -291,7 +293,7 @@ async def handle_webhook(task_id: str, secret: str, request: Request):
         task["status"] = "completed" if success_flag else "error"
         # Normalize result & error fields
         task["result"] = result_message.data.payload if result_message.data else None
-        task["error"] = result_message.error_message if result_message.data else result_message.error_message
+        task["error"] = result_message.error_message
         task["updated_at"] = datetime.now()
 
         logger.info(f"✅ Task {task_id} completed status={task['status']}")
@@ -340,6 +342,12 @@ async def wait_for_task_completion(task_id: str, timeout: int):
     """Фоновая задача для ожидания завершения"""
     start_time = time.time()
     
+    """
+    TODO
+    НАСТРОИТЬ ОБЩЕНИЕ С ВОРКЕРОМ СЛУЧАЕ ТАЙМАУТА
+    """
+
+    #! ТАЙМАУТ
     while time.time() - start_time < timeout:
         if task_id in task_store:
             task = task_store[task_id]
@@ -353,6 +361,20 @@ async def wait_for_task_completion(task_id: str, timeout: int):
     if task_id in task_store:
         task_store[task_id]["status"] = "timeout"
         logger.warning(f"⏰ Task {task_id} timed out after {timeout} seconds")
+        client_callback_url = task.get("client_callback_url")
+
+        # Отправим отчет о том что время кончилось
+        if client_callback_url:
+            # send concise payload to client
+            send_payload = {
+                "task_id": task_id,
+                "status": "delete task",
+                "result": None,
+                "error": f"timeout: {timeout}"
+            }
+            # fire-and-forget (don't block wrapper)
+            asyncio.create_task(send_webhook_to_client(client_callback_url, send_payload))
+            logger.info(f"📤 Client callback enqueued for task {task_id}")
 
 async def send_webhook_to_client(url: str, data: dict):
     """Отправка вебхука клиенту"""

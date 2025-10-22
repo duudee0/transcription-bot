@@ -376,7 +376,7 @@ async def handle_test1(message: Message):
             input_data=input_data,
             parameters=parameters,
             service_chain=service_chain,
-            timeout=GLOBAL_TIMEOUT,
+            timeout=GLOBAL_TIMEOUT*30,
             client_callback_url=CLIENT_CALLBACK_URL_FOR_WRAPPER
         )
     except Exception as e:
