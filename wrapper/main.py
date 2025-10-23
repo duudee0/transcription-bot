@@ -126,7 +126,7 @@ class StatusResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-async def get_publisher():
+def get_publisher():
     """Возвращает глобальный publisher"""
     global publisher
     if publisher is None:
@@ -192,7 +192,7 @@ async def create_task(task_request: TaskRequest, background_tasks: BackgroundTas
     }
 
     # Publish to queue
-    pub = await get_publisher()
+    pub = get_publisher()
     await pub.publish_task(task_message)
 
     logger.info(f"📨 Task created: {task_id}, type: {task_request.task_type}")
@@ -295,8 +295,8 @@ async def handle_webhook(task_id: str, secret: str, request: Request):
                 "error": task["error"]
             }
             # fire-and-forget (don't block wrapper)
-            asyncio.create_task(send_webhook_to_client(client_callback_url, send_payload))
-            logger.info(f"📤 Client callback enqueued for task {task_id}")
+            res = asyncio.create_task(send_webhook_to_client(client_callback_url, send_payload))
+            logger.info(f"📤 Client callback enqueued for task {task_id}, {res}")
 
         # Optionally: delete webhook_secret to avoid replays (one-time)
         task_store[task_id]["webhook_secret"] = None
@@ -359,8 +359,8 @@ async def wait_for_task_completion(task_id: str, timeout: int):
                 "error": f"timeout: {timeout}"
             }
             # fire-and-forget (don't block wrapper)
-            asyncio.create_task(send_webhook_to_client(client_callback_url, send_payload))
-            logger.info(f"📤 Client callback enqueued for task {task_id}")
+            res = asyncio.create_task(send_webhook_to_client(client_callback_url, send_payload))
+            logger.info(f"📤 Client callback enqueued for task {task_id}, {res}")
 
 async def send_webhook_to_client(url: str, data: dict):
     """Отправка вебхука клиенту"""

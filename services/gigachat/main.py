@@ -31,7 +31,7 @@ class GigaChatService(BaseService):
         return task_type in supported_task_types
     
 
-    async def _health_handler(self):
+    def _health_handler(self):
         """Переопределяем health handler для проверки токена"""
         status = "ok" if self.gigachat_token else "no_token"
         return {
@@ -45,10 +45,12 @@ class GigaChatService(BaseService):
         """Валидация задачи для GigaChat сервиса"""
         # Проверяем токен
         if not self.gigachat_token:
+            print(" ‼️ GIGACHAT_TOKEN not configured ")
             raise HTTPException(status_code=500, detail="GIGACHAT_TOKEN not configured")
         
         # Проверяем тип задачи
         if task_message.data.payload_type != PayloadType.TEXT:
+            print(" ⛔ Unsupported task type: {task_message.data.payload_type}. Only 'generate_response' is supported")
             raise HTTPException( # Этот сервис ожидает текстовый запрос
                 status_code=400, 
                 detail=f"Unsupported task type: {task_message.data.payload_type}. Only 'generate_response' is supported"
@@ -57,8 +59,8 @@ class GigaChatService(BaseService):
         # Проверяем наличие промпта
         prompt = task_message.data.payload.get("text", "")
         if not prompt:
-            raise HTTPException(status_code=500, detail=f"Prompt is required for generate_response task")
-    # TODO воркер не хочет нормально обрабатывать ошибки
+            print(" ⛔ Prompt 'text' in payload is required for generate_response task")
+            raise HTTPException(status_code=500, detail="Prompt 'text' in payload is required for generate_response task")
 
     async def _process_task_logic(self, task_message: TaskMessage) -> Data:
         """Логика обработки задачи через GigaChat"""
@@ -93,7 +95,7 @@ class GigaChatService(BaseService):
             )
             return response
         except Exception as e:
-            raise Exception(f"GigaChat API error: {str(e)}")
+            raise RuntimeError(f"GigaChat API error: {str(e)}") from e
     
     def _sync_gigachat_call(self, prompt: str) -> str:
         """Синхронный вызов GigaChat"""

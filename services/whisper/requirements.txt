@@ -3,6 +3,7 @@ fastapi
 uvicorn
 httpx
 aio_pika
+aiofiles
 
 # для того чтобы whisper работал из python кода 
 openai-whisper

@@ -50,13 +50,8 @@ class AsyncTaskManager:
         # Publisher (инжектируется извне, например в main: task_manager.publisher = publisher)
         # Если None — используем send_to_result_queue() как fallback.
         self.publisher: Optional[Any] = None
-
-    async def start_monitoring(self):
-        """Запускает фоновый мониторинг задач"""
-        logger.info("🔍 Starting async task monitor...")
-        asyncio.create_task(self._monitor_loop())
     
-    async def _monitor_loop(self):
+    async def start_monitoring(self):
         """Основной цикл мониторинга"""
         while True:
             try:
@@ -179,7 +174,6 @@ class AsyncTaskManager:
             original_message_id=task_state.task.message_id,
             success=True,
             data=Data(
-                #task_type = result_data.get('data').get('task_type'),
                 payload_type = PayloadType.TEXT,
                 payload=result_data.data.payload,
                 execution_metadata={
@@ -195,7 +189,7 @@ class AsyncTaskManager:
             await task_state.message.ack()
             logger.info(f"✅ Message acknowledged for completed task {task_id}")
         except Exception as e:
-            logger.exception("⛔ Failed to ack service-down result for task %s: %s", task_id, e)
+            logger.exception(f"⛔ Failed to ack service-down result for task {task_id}: {e}")
 
         try:
             if self.publisher:
@@ -203,9 +197,9 @@ class AsyncTaskManager:
             else:
                 await send_to_result_queue(result_message)
         except Exception as e:
-            logger.exception("Failed to publish completed result for task %s: %s", task_id, e)
+            logger.exception(f"Failed to publish completed result for task {task_id}: {e}")
         finally:
-            await self._finalize_task(task_id)
+            self._finalize_task(task_id)
     
     async def _handle_task_failed(self, task_id: str, error: str):
         """Обработка неудачной задачи"""
@@ -227,7 +221,7 @@ class AsyncTaskManager:
             await task_state.message.nack(requeue=False) #! НЕ Вернуть в очередь
             logger.info(f"✅ Message acknowledged for completed task {task_id}")
         except Exception as e:
-            logger.exception("⛔ Failed to ack service-down result for task %s: %s", task_id, e)
+            logger.exception(f"⛔ Failed to ack service-down result for task {task_id}: {e}")
 
         try:
             if self.publisher:
@@ -235,15 +229,15 @@ class AsyncTaskManager:
             else:
                 await send_to_result_queue(result_message)
         except Exception as e:
-            logger.exception("Failed to publish failed result for task %s: %s", task_id, e)
+            logger.exception(f"Failed to publish failed result for task {task_id}: {e}",)
         finally:
-            await self._finalize_task(task_id)
+            self._finalize_task(task_id)
     
     async def _handle_task_timeout(self, task_id: str):
         """Обработка таймаута задачи"""
         task_state = self.active_tasks.get(task_id)
         if not task_state:
-            logger.warning("Tried to timeout unknown task %s", task_id)
+            logger.warning(f"Tried to timeout unknown task {task_id}")
             return
 
         logger.error(f"⏰ Task {task_id} timeout after {self.max_wait_time}s")
@@ -260,7 +254,7 @@ class AsyncTaskManager:
             await task_state.message.nack(requeue=True) # Вернуть в очередь
             logger.info(f"✅ Message acknowledged for completed task {task_id}")
         except Exception as e:
-            logger.exception("⛔ Failed to ack service-down result for task %s: %s", task_id, e)
+            logger.exception(f"⛔ Failed to ack service-down result for task {task_id}: {e}")
 
         try:
             if self.publisher:
@@ -268,15 +262,15 @@ class AsyncTaskManager:
             else:
                 await send_to_result_queue(result_message)
         except Exception as e:
-            logger.exception("Failed to publish timeout result for task %s: %s", task_id, e)
+            logger.exception(f"Failed to publish timeout result for task {task_id}: {e}")
         finally:
-            await self._finalize_task(task_id)
+            self._finalize_task(task_id)
     
     async def _handle_service_down(self, task_id: str):
         """Обработка недоступности сервиса"""
         task_state = self.active_tasks.get(task_id)
         if not task_state:
-            logger.warning("Tried to handle service down for unknown task %s", task_id)
+            logger.warning(f"Tried to handle service down for unknown task {task_id}")
             return
 
         logger.error(f"🚨 Service down for task {task_id}")
@@ -293,21 +287,21 @@ class AsyncTaskManager:
             await task_state.message.nack(requeue=True) # Вернуть в очередь
             logger.info(f"✅ Message acknowledged for completed task {task_id}")
         except Exception as e:
-            logger.exception("⛔ Failed to ack service-down result for task %s: %s", task_id, e)
+            logger.exception(f"⛔ Failed to ack service-down result for task {task_id}: {e}")
         try:
             if self.publisher:
                 await self.publisher.publish_result(result_message)
             else:
                 await send_to_result_queue(result_message)
         except Exception as e:
-            logger.exception("Failed to publish service-down result for task %s: %s", task_id, e)
+            logger.exception(f"Failed to publish service-down result for task {task_id}: {e}")
         finally:
-            await self._finalize_task(task_id)
+            self._finalize_task(task_id)
 
     # ----------------------------
     # финализация: удалить state и release семафор
     # ----------------------------
-    async def _finalize_task(self, task_id: str):
+    def _finalize_task(self, task_id: str):
         """Снять задачу и освободить слот семафора — вернуть state или None."""
         task_state = self.active_tasks.pop(task_id, None)
         if task_state:
@@ -355,7 +349,7 @@ class AsyncTaskManager:
                 task_state = self.active_tasks.get(str(orig_id))
 
         if not task_state:
-            logger.warning(f"🤔 Webhook for unknown task: {message_id} (payload keys: {list(payload)})")
+            logger.warning(f"🤔 Webhook for unknown task: {message_id}")
             return False
 
         # mark callback received
@@ -372,7 +366,3 @@ class AsyncTaskManager:
             logger.error(f"❌ Webhook: task {task_id} failed")
             await self._handle_task_failed(task_id, payload.error_message or "Unknown error")
             return True
-
-        # If webhook came but status unknown — keep callback_received true and let monitor poll history
-        logger.info(f"ℹ️ Webhook for {task_id} received but status unknown; will be polled")
-        return True

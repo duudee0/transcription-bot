@@ -1,3 +1,4 @@
+import aiofiles
 import httpx
 from common.base_service import BaseService
 from common.models import PayloadType, TaskMessage, Data
@@ -37,7 +38,7 @@ class WhisperService(BaseService):
         ]
         return task_type in supported_task_types
 
-    async def _health_handler(self):
+    def _health_handler(self):
         """Проверка здоровья сервиса"""
         try:
             return {
@@ -133,13 +134,14 @@ class WhisperService(BaseService):
             temp_filename = f"whisper_{uuid.uuid4().hex}.audio"
             temp_filepath = os.path.join(temp_dir, temp_filename)
             
-            # Скачиваем файл
+            # Скачиваем файл асинхронно
             async with self.client.stream('GET', audio_url, timeout=self.download_timeout) as response:
                 response.raise_for_status()
                 
-                with open(temp_filepath, 'wb') as f:
+                # Асинхронная запись файла
+                async with aiofiles.open(temp_filepath, 'wb') as f:
                     async for chunk in response.aiter_bytes():
-                        f.write(chunk)
+                        await f.write(chunk)
             
             return temp_filepath
             

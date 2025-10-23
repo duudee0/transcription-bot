@@ -5,7 +5,7 @@ import asyncio
 from typing import Dict, Any
 
 # ТЕСТОВАЯ ЗАДЕРЖКА УКАЗЫВАТЬ
-TESTING_SLEEP = 2
+TESTING_SLEEP = 20
 
 class LLMService(BaseService):
     """LLM Service с тестовой реализацией"""
@@ -47,8 +47,6 @@ class LLMService(BaseService):
             result = await self._generate_response(input_data)
         else:
             result = await self._analyze_text(input_data)
-        
-        print(f" 🙏 {result}")
         
         return Data(
             payload_type = PayloadType.TEXT,

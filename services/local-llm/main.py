@@ -19,16 +19,6 @@ class LocalModelService(BaseService):
 
         # Создаем асинхронный клиент httpx
         self.client = httpx.AsyncClient(timeout=self.timeout)
-
-
-    def _can_handle_task_type(self, task_type: str) -> bool:
-        """Определяет, может ли сервис обработать тип задачи"""
-        supported_task_types = [
-            "generate_response", 
-            "text_generation",
-            "code_generation"
-        ]
-        return task_type in supported_task_types
     
     def _can_handle_task_type(self, task_type: str) -> bool:
         """Определяет, может ли сервис обработать тип задачи"""
@@ -39,7 +29,7 @@ class LocalModelService(BaseService):
         ]
         return task_type in supported_task_types
 
-    async def _health_handler(self):
+    def _health_handler(self):
         """Проверка здоровья сервиса и доступности модели"""
         try:
             # Проверяем доступность Ollama

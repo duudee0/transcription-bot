@@ -40,26 +40,26 @@ class BaseService:
         self._register_common_endpoints()
 
         # Отправка в rabbitmq
-        self.publisher: Publisher = None
+        self.publisher: Optional[Publisher] = None
     
     def _register_common_endpoints(self):
         """Регистрирует общие эндпоинты для всех сервисов"""
         
         @self.app.get("/health")
-        async def health():
-            return await self._health_handler()
+        def health():
+            return self._health_handler()
         
         @self.app.get("/status")
-        async def status():
-            return await self._status_handler()
+        def status():
+            return self._status_handler()
         
         @self.app.get("/requests")
-        async def list_requests():
-            return await self._list_requests_handler()
+        def list_requests():
+            return self._list_requests_handler()
         
         @self.app.get("/requests/{request_id}")
-        async def get_request(request_id: str):
-            return await self._get_request_handler(request_id)
+        def get_request(request_id: str):
+            return self._get_request_handler(request_id)
         
         @self.app.post("/api/v1/process")
         async def process_task_endpoint(request: Request, background_tasks: BackgroundTasks):
@@ -134,7 +134,6 @@ class BaseService:
         """
         ОБРАБОТЧИК ЗАДАЧ С ПОДДЕРЖКОЙ ЦЕПОЧЕК
         """
-        start_time = time.time()
         
         try:
             # Парсим входящий JSON и валидируем как TaskMessage
@@ -163,7 +162,6 @@ class BaseService:
             
             # Проверяем поддержку вебхука
             callback_url = task_message.data.callback_url
-            # webhook_supported = task_message.data.input_data.get("webhook_supported", False)
             
             # if callback_url and webhook_supported and not self.is_processing:
             print(f"🔔 Webhook mode activated for {task_message.message_id}", file=sys.stderr)
@@ -199,26 +197,8 @@ class BaseService:
             raise
             
         except Exception as e:
-            processing_time = (time.time() - start_time) * 1000
             print(f"❌ {self.service_name} error: {e}", file=sys.stderr)
-            
-            # TODO: ВОРКЕР НОРМАЛЬНО НЕ РЕАГИРУЕТ НА ТАКОЙ ОТВЕТ А СЛЕДОВАЛО БЫ ЕГО НАУЧИТЬ
-            # error_result = ResultMessage(
-            #     message_type=MessageType.RESULT,
-            #     source_service=self.service_name,
-            #     target_services=task_message.target_services if 'task_message' in locals() else None,
-            #     original_message_id=getattr(task_message, 'message_id', None),
-            #     data=ResultData(
-            #         success=False,
-            #         error_message=str(e),
-            #         execution_metadata={
-            #             "processing_time_ms": processing_time,
-            #             "error": True,
-            #             "service": self.service_name
-            #         }
-            #     )
-            # )
-            # return error_result
+
             raise HTTPException(
                 status_code=500,
                 detail=f"Internal server error: {str(e)}"
@@ -251,8 +231,8 @@ class BaseService:
                     original_message_id=task_message.data.original_message_id,
                     parameters=task_message.data.parameters,
                     execution_metadata={**task_message.data.execution_metadata, 
-                                        **result_data.execution_metadata}
-                    #callback_url=None
+                                        **result_data.execution_metadata},
+                    callback_url=None
                 )
             )
             
@@ -293,7 +273,7 @@ class BaseService:
                 source_service=self.service_name,
                 target_services=[],
                 original_message_id=task_message.message_id,
-                success=True if not result_data.payload_type == PayloadType.ERROR else False,
+                success=True if result_data.payload_type != PayloadType.ERROR else False,
                 data=result_data
             )
             
@@ -303,7 +283,7 @@ class BaseService:
                 await self._send_webhook_to_wrapper(wrapper_callback_url, final_result)
                 print(f"📤 Final result sent to wrapper: {wrapper_callback_url}", file=sys.stderr)
             else:
-                print(f"⚠️ No wrapper_callback_url for final result", file=sys.stderr)
+                print("⚠️ No wrapper_callback_url for final result", file=sys.stderr)
             
             return final_result
         
@@ -374,7 +354,7 @@ class BaseService:
                     source_service=self.service_name,
                     target_services=[],  # цепочка завершена
                     original_message_id=task_message.message_id,
-                    success=True if not result_data.payload_type == PayloadType.ERROR else False,
+                    success=True if result_data.payload_type != PayloadType.ERROR else False,
                 )
 
             await self._send_webhook(callback_url, next_message)
@@ -394,7 +374,7 @@ class BaseService:
                 success=False,
                 data=Data(
                     payload_type = PayloadType.ERROR,
-                    payload={"text":str(e)}, #TODO ОГРАНИЧИТЬ ОТВЕТ ОШИБКИ
+                    payload={"text":str(type(e).__name__)},
                     execution_metadata={"error": True, "service": self.service_name}
                 )
             )
@@ -442,8 +422,7 @@ class BaseService:
             traceback.print_exc(file=sys.stderr)
             return False
 
-    # Остальные методы остаются без изменений:
-    async def _health_handler(self) -> Dict[str, Any]:
+    def _health_handler(self) -> Dict[str, Any]:
         """Обработчик health check"""
         return {
             "status": "ok", 
@@ -451,7 +430,7 @@ class BaseService:
             "timestamp": time.time()
         }
     
-    async def _status_handler(self) -> Dict[str, Any]:
+    def _status_handler(self) -> Dict[str, Any]:
         """Обработчик статуса сервиса"""
         status_info = {
             "is_busy": self.is_processing,
@@ -468,14 +447,14 @@ class BaseService:
         
         return status_info
     
-    async def _list_requests_handler(self) -> Dict[str, Any]:
+    def _list_requests_handler(self) -> Dict[str, Any]:
         """Обработчик списка запросов"""
         return {
             "total_requests": len(self.processing_history),
             "requests": self.processing_history
         }
     
-    async def _get_request_handler(self, request_id: str) -> Dict[str, Any]:
+    def _get_request_handler(self, request_id: str) -> Dict[str, Any]:
         """Обработчик получения конкретного запроса"""
         if request_id in self.processing_history:
             return self.processing_history[request_id]

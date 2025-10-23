@@ -326,7 +326,7 @@ async def handle_test1(message: Message):
 
     request = message.text.removeprefix("/ollama")
     if not request:
-        await message.answer(f"Вы не передали команде запрос!")
+        await message.answer("Вы не передали команде запрос!")
         return
     
     chat_id = message.chat.id
@@ -347,13 +347,13 @@ async def handle_test1(message: Message):
             client_callback_url=CLIENT_CALLBACK_URL_FOR_WRAPPER
         )
     except Exception as e:
-        logger.exception("Failed to create test1 task: %s", e)
+        logger.exception(f"Failed to create test1 task: {e}")
         await message.answer(f"Ошибка при создании задачи: {e}")
         return
 
     task_id = _get_task_id_from_wrapper_response(resp)
     if not task_id:
-        logger.warning("Wrapper returned unexpected response while creating task: %s", resp)
+        logger.warning(f"Wrapper returned unexpected response while creating task: {resp}")
         await message.answer(f"Wrapper ответил без task_id: {resp}")
         return
 
@@ -365,7 +365,9 @@ async def handle_test1(message: Message):
     polling_task = asyncio.create_task(poll_fallback(task_id, chat_id, GLOBAL_TIMEOUT))
     polling_tasks[task_id] = polling_task
 
-    await info_msg.edit_text("Тестовая задача отправлена. Ожидаю результат (вы получите push, когда wrapper пришлёт callback).")
+    await info_msg.edit_text("""
+    Тестовая задача отправлена. Ожидаю результат (вы получите push, когда wrapper пришлёт callback).
+    """)
 
 @router.message(Command("ollama2"))
 async def handle_test1(message: Message):
@@ -460,7 +462,7 @@ async def handle_test2(message: Message):
     """Обработчик тестовой задачи 2 - генерация ответа"""
     chat_id = message.chat.id
     task_type = "generate_response"
-    input_data = {"prompt": "Придумай смешной твит про программистов."}
+    input_data = {"text": "Придумай смешной твит про программистов."}
     parameters = {"max_tokens": 80}
     service_chain = ["gigachat-service"]
 
@@ -659,8 +661,6 @@ async def handle_voice(message: Message, state: FSMContext):
         await message.answer("⚠️ Эта функция работает только с голосовыми сообщениями!")
         return
     
-    user_data = await state.get_data()
-    
     # Создаем задачу
     status_msg = await message.answer("Отправляю задачу...")
 
@@ -811,16 +811,10 @@ async def poll_fallback(task_id: str, chat_id: int, timeout: int):
                     # Задача еще выполняется, продолжаем поллинг
                     await asyncio.sleep(POLL_INTERVAL)
                     
-            except asyncio.CancelledError:
-                # Задача была отменена (вероятно, пришел вебхук)
-                logger.info("Polling task for %s was cancelled", task_id)
-                return
             except Exception as e:
                 logger.warning("Error during polling for %s: %s", task_id, e)
                 await asyncio.sleep(POLL_INTERVAL)  # Ждем перед повторной попыткой
 
-    except asyncio.CancelledError:
-        logger.info("Polling task for %s was cancelled", task_id)
     except Exception as e:
         logger.exception("Error in poll fallback for %s: %s", task_id, e)
         await bot.send_message(chat_id, f"Ошибка при polling для {task_id}: {e}")
@@ -878,19 +872,19 @@ async def main():
     async def safe_run_fastapi():
         try:
             await run_fastapi()
-        except Exception as e:
+        except Exception:
             logger.exception("FastAPI task failed")
 
     async def safe_run_bot():
         try:
             await dp.start_polling(bot)
-        except Exception as e:
+        except Exception:
             logger.exception("Bot polling failed")
 
     async def safe_cleanup():
         try:
             await cleanup_old_tasks()
-        except Exception as e:
+        except Exception:
             logger.exception("Cleanup task failed")
 
     fastapi_task = asyncio.create_task(safe_run_fastapi())

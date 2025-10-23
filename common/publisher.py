@@ -147,61 +147,111 @@ class Publisher:
     # publish with retry/backoff
     # -------------------------
     async def publish_message(self, body: bytes, routing_key: str,
-                              headers: Optional[Dict[str, Any]] = None,
-                              priority: Optional[int] = None,
-                              max_attempts: int = 3) -> None:
+                            headers: Optional[Dict[str, Any]] = None,
+                            priority: Optional[int] = None,
+                            max_attempts: int = 3) -> None:
         """
         Robust publish: tries a few times on AMQP errors with exponential backoff.
         Raises PublisherError on fatal failure.
         """
         if self._rate_limit:
             await self._rate_limit.acquire()
+        
+        try:
+            await self._publish_message_internal(body, routing_key, headers, priority, max_attempts)
+        finally:
+            self._release_rate_limit()
+
+    async def _publish_message_internal(self, body: bytes, routing_key: str,
+                                    headers: Optional[Dict[str, Any]] = None,
+                                    priority: Optional[int] = None,
+                                    max_attempts: int = 3) -> None:
+        """Internal implementation of message publishing."""
+        body_to_send, cc = await self._maybe_claim_check(body)
+        msg = self._create_message(body_to_send, headers, priority)
+        
+        await self._publish_with_retry(msg, routing_key, max_attempts, body_to_send, cc)
+
+    def _create_message(self, body: bytes, headers: Optional[Dict[str, Any]] = None, 
+                    priority: Optional[int] = None) -> Message:
+        """Create a Message object with the given parameters."""
+        msg_headers = dict(headers or {})
+        msg = Message(
+            body,
+            headers=msg_headers,
+            delivery_mode=DeliveryMode.PERSISTENT,
+            content_type="application/json",
+            message_id=msg_headers.get("message_id") or None,
+            correlation_id=msg_headers.get("correlation_id") or None
+        )
+
+        if priority is not None:
+            try:
+                msg.priority = int(priority)
+            except Exception:
+                logger.debug("priority not applied: %r", priority)
+        
+        return msg
+
+    async def _publish_with_retry(self, msg: Message, routing_key: str, max_attempts: int,
+                                body_to_send: bytes, claim_check: bool) -> None:
+        """Publish message with retry logic and exponential backoff."""
+        attempt = 0
+        backoff = 0.05
+        
+        while attempt < max_attempts:
+            success = await self._attempt_publish(msg, routing_key, body_to_send, claim_check, attempt)
+            if success:
+                return
+            
+            attempt += 1
+            if attempt >= max_attempts:
+                self._handle_publish_failure(routing_key, attempt)
+                return
+            
+            await asyncio.sleep(backoff)
+            backoff *= 2
+
+    async def _attempt_publish(self, msg: Message, routing_key: str, body_to_send: bytes,
+                            claim_check: bool, attempt: int) -> bool:
+        """Single attempt to publish a message."""
         try:
             ch = await self._ensure_channel()
-            body_to_send, cc = await self._maybe_claim_check(body)
-            msg_headers = dict(headers or {})
-            msg = Message(
-                body_to_send,
-                headers=msg_headers,
-                delivery_mode=DeliveryMode.PERSISTENT,
-                content_type="application/json",
-                message_id=msg_headers.get("message_id") or None,
-                correlation_id=msg_headers.get("correlation_id") or None
-            )
+            await ch.default_exchange.publish(msg, routing_key=routing_key)
+            
+            self._record_publish_success(body_to_send, routing_key, claim_check, msg.headers)
+            return True
+            
+        except Exception as e:
+            self._handle_publish_attempt_error(e, routing_key, attempt)
+            return False
 
-            if priority is not None:
-                try:
-                    msg.priority = int(priority)
-                except Exception:
-                    logger.debug("priority not applied: %r", priority)
+    def _record_publish_success(self, body_to_send: bytes, routing_key: str, 
+                            claim_check: bool, headers: Dict[str, Any]) -> None:
+        """Record successful publish metrics and logs."""
+        self.metrics["publish_success"] += 1
+        self.metrics["publish_bytes"] += len(body_to_send)
+        logger.debug("Published message -> %s (bytes=%d claim_check=%s headers=%s)",
+                    routing_key, len(body_to_send), claim_check, list(headers.keys()))
 
-            attempt = 0
-            backoff = 0.05
-            while True:
-                try:
-                    await ch.default_exchange.publish(msg, routing_key=routing_key)
-                    self.metrics["publish_success"] += 1
-                    self.metrics["publish_bytes"] += len(body_to_send)
-                    logger.debug("Published message -> %s (bytes=%d claim_check=%s headers=%s)",
-                                 routing_key, len(body_to_send), cc, list(msg_headers.keys()))
-                    return
-                except Exception as e:
-                    attempt += 1
-                    self.metrics["publish_retry"] += 1
-                    logger.warning("Publish attempt %d failed to %s: %s", attempt, routing_key, e)
-                    if attempt >= max_attempts:
-                        self.metrics["publish_fail"] += 1
-                        logger.exception("Publish failed after %d attempts", attempt)
-                        raise PublisherError(f"failed to publish to {routing_key}: {e}")
-                    await asyncio.sleep(backoff)
-                    backoff *= 2
-        finally:
-            if self._rate_limit:
-                try:
-                    self._rate_limit.release()
-                except Exception:
-                    pass
+    def _handle_publish_attempt_error(self, error: Exception, routing_key: str, attempt: int) -> None:
+        """Handle errors during publish attempts."""
+        self.metrics["publish_retry"] += 1
+        logger.warning("Publish attempt %d failed to %s: %s", attempt + 1, routing_key, error)
 
+    def _handle_publish_failure(self, routing_key: str, attempt: int) -> None:
+        """Handle final publish failure after all retries."""
+        self.metrics["publish_fail"] += 1
+        logger.exception("Publish failed after %d attempts", attempt)
+        raise PublisherError(f"failed to publish to {routing_key} after {attempt} attempts")
+
+    def _release_rate_limit(self) -> None:
+        """Safely release rate limit semaphore."""
+        if self._rate_limit:
+            try:
+                self._rate_limit.release()
+            except Exception:
+                pass
     # -------------------------
     # higher-level helpers
     # -------------------------
