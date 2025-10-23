@@ -86,7 +86,9 @@ def make_main_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="/ollama"), KeyboardButton(text="/transcribe")],
             [KeyboardButton(text="/task"), KeyboardButton(text="/mytasks")],
-            [KeyboardButton(text="/help")]
+            [KeyboardButton(text="/ollama2"), KeyboardButton(text="/voice")],
+            [KeyboardButton(text="/test1"), KeyboardButton(text="/test2")],
+            [KeyboardButton(text="/transcribe"), KeyboardButton(text="/help")],
         ],
         resize_keyboard=True
     )
@@ -311,9 +313,9 @@ async def handle_start(message: Message):
         "/task 'task_type' 'json_input_data' ['json_parameters']\n\n"
         "Или воспользуйся тестовыми кнопками ниже.\n\n"
         "Доступные команды:\n"
-        "/ollama <текст> - запрос к локальной модели\n"
-        "/ollama2 <текст> - запрос к локальной модели и посчитать количество слов (в другом контейнере)\n"
-        "/transcribe <url> - транскрибация аудио по URL\n\n"
+        "/ollama текст - запрос к локальной модели\n"
+        "/ollama2 текст - запрос к локальной модели и посчитать количество слов (в другом контейнере)\n"
+        "/transcribe url - транскрибация аудио по URL\n\n"
         "Также можно отправить голосовое сообщение - я его расшифрую!\n"
     )
     await message.answer(txt, reply_markup=make_main_keyboard(), parse_mode='HTML')
@@ -873,17 +875,33 @@ async def main():
     """Основная функция запуска"""
     logger.info("Starting combined FastAPI + Aiogram bot...")
     
-    # Запускаем обе службы параллельно
-    fastapi_task = asyncio.create_task(run_fastapi())
-    bot_task = asyncio.create_task(dp.start_polling(bot))
-    cleanup_tasks = asyncio.create_task(cleanup_old_tasks())
-    
+    async def safe_run_fastapi():
+        try:
+            await run_fastapi()
+        except Exception as e:
+            logger.exception("FastAPI task failed")
+
+    async def safe_run_bot():
+        try:
+            await dp.start_polling(bot)
+        except Exception as e:
+            logger.exception("Bot polling failed")
+
+    async def safe_cleanup():
+        try:
+            await cleanup_old_tasks()
+        except Exception as e:
+            logger.exception("Cleanup task failed")
+
+    fastapi_task = asyncio.create_task(safe_run_fastapi())
+    bot_task = asyncio.create_task(safe_run_bot())
+    cleanup_task = asyncio.create_task(safe_cleanup())
+
     try:
-        await asyncio.gather(fastapi_task, bot_task, cleanup_tasks)
+        await asyncio.gather(fastapi_task, bot_task, cleanup_task)
     except KeyboardInterrupt:
         logger.info("Shutdown requested by KeyboardInterrupt")
     finally:
-        # Корректное завершение
         await bot.session.close()
         global http_client
         if http_client:
