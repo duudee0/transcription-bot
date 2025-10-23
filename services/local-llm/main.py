@@ -4,8 +4,7 @@ from common.models import PayloadType, TaskMessage, Data
 from fastapi import HTTPException
 import os
 import requests
-import json
-from typing import Dict, Any
+
 
 class LocalModelService(BaseService):
     """Local Model Service с использованием Ollama"""
