@@ -20,4 +20,4 @@ venv.bak/
 *.tmp
 *.temp
 rabbitmq/
-services/whisper/common/
+services/*/common/
