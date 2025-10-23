@@ -83,6 +83,25 @@ services:
       - internal
       - ollama
 
+  whisper:
+    build:
+      context: ./
+      dockerfile: services/whisper/Dockerfile
+    environment:
+      - PORT=8000
+      - WHISPER_MODEL=base
+      - WHISPER_TIMEOUT=300
+    ports:
+      - "8005:8000"   # Новый порт для whisper service
+    networks:
+      - internal
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
+
   llm-service:
     build:
       context: ./

@@ -224,7 +224,7 @@ class AsyncTaskManager:
 
         try:
             # ПОДТВЕРЖДАЕМ СООБЩЕНИЕ ТОЛЬКО ЗДЕСЬ
-            await task_state.message.nack(requeue=True) # Вернуть в очередь
+            await task_state.message.nack(requeue=False) #! НЕ Вернуть в очередь
             logger.info(f"✅ Message acknowledged for completed task {task_id}")
         except Exception as e:
             logger.exception("⛔ Failed to ack service-down result for task %s: %s", task_id, e)

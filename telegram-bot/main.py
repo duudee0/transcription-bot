@@ -83,7 +83,7 @@ def make_main_keyboard() -> ReplyKeyboardMarkup:
     """Создает основную клавиатуру с командами"""
     kb = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="/test1"), KeyboardButton(text="/test2")],
+            [KeyboardButton(text="/ollama"), KeyboardButton(text="/transcribe")],
             [KeyboardButton(text="/task"), KeyboardButton(text="/mytasks")],
             [KeyboardButton(text="/help")]
         ],
@@ -309,8 +309,11 @@ async def handle_start(message: Message):
         "Можешь отправить задачу в ручном формате:\n"
         "/task 'task_type' 'json_input_data' ['json_parameters']\n\n"
         "Или воспользуйся тестовыми кнопками ниже.\n\n"
-        "Пример ручной команды:\n"
-        "/task analyze_text {\"text\":\"Привет мир\"} {\"detailed_analysis\":true}\n"
+        "Доступные команды:\n"
+        "/ollama <текст> - запрос к локальной модели\n"
+        "/ollama2 <текст> - запрос к локальной модели и посчитать количество слов (в другом контейнере)\n"
+        "/transcribe <url> - транскрибация аудио по URL\n\n"
+        "Также можно отправить голосовое сообщение - я его расшифрую!\n"
     )
     await message.answer(txt, reply_markup=make_main_keyboard(), parse_mode='HTML')
 
@@ -573,6 +576,112 @@ async def handle_parameters(message: Message, state: FSMContext):
     
     await state.clear()
     await message.answer("Что дальше?", reply_markup=make_main_keyboard())
+
+# Whisper
+@router.message(Command("transcribe"))
+async def handle_transcribe(message: Message):
+    """Обработчик команды транскрибации по URL"""
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Пожалуйста, укажите URL аудио после команды: /transcribe <audio_url>")
+        return
+
+    audio_url = parts[1].strip()
+    await process_audio_transcription(message, audio_url, "url")
+
+async def process_audio_transcription(message: Message, audio_input: str, input_type: str = "url"):
+    """Общая функция для обработки транскрибации аудио"""
+    chat_id = message.chat.id
+    
+    if input_type == "url":
+        info_msg = await message.answer(f"🔄 Начинаю транскрибацию аудио по URL...")
+        task_type = "transcribe_audio"
+        input_data = {"audio_url": audio_input}
+    else:  # voice message
+        info_msg = await message.answer("🔄 Обрабатываю голосовое сообщение...")
+        task_type = "transcribe_audio"
+        input_data = {"audio_url": audio_input}
+    
+    parameters = {"language": "ru"}  # Можно определить язык автоматически или по настройкам
+    
+    try:
+        resp = await create_task_on_wrapper(
+            task_type=task_type,
+            input_data=input_data,
+            parameters=parameters,
+            timeout=GLOBAL_TIMEOUT * 2,  # Увеличиваем таймаут для аудио
+            client_callback_url=CLIENT_CALLBACK_URL_FOR_WRAPPER
+        )
+    except Exception as e:
+        logger.exception("Failed to create transcribe task: %s", e)
+        await message.answer(f"❌ Ошибка при создании задачи транскрибации: {e}")
+        return
+
+    task_id = _get_task_id_from_wrapper_response(resp)
+    if not task_id:
+        logger.warning("Wrapper returned unexpected response while creating transcribe task: %s", resp)
+        await message.answer(f"❌ Wrapper ответил без task_id: {resp}")
+        return
+
+    # Сохраняем mapping task->chat
+    task_to_chats.setdefault(task_id, []).append(chat_id)
+    task_meta.setdefault(task_id, {}).update({
+        "type": task_type, 
+        "created_by": chat_id,
+        "input_type": input_type
+    })
+
+    # Запускаем polling fallback
+    polling_task = asyncio.create_task(poll_fallback(task_id, chat_id, GLOBAL_TIMEOUT * 2))
+    polling_tasks[task_id] = polling_task
+
+    await info_msg.edit_text(
+        f"✅ Задача транскрибации отправлена (ID: {task_id}).\n"
+        f"Ожидаю результат..."
+    )
+
+@router.message(lambda message: message.voice is not None)
+async def handle_voice_message(message: Message):
+    """Обработчик голосовых сообщений"""
+    try:
+        # Получаем информацию о файле голосового сообщения
+        file_id = message.voice.file_id
+        file = await bot.get_file(file_id)
+        file_path = file.file_path
+        
+        # Формируем URL для скачивания файла
+        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        
+        logger.info(f"Processing voice message: {file_url}")
+        
+        # Отправляем на транскрибацию
+        await process_audio_transcription(message, file_url, "voice")
+        
+    except Exception as e:
+        logger.exception("Error processing voice message: %s", e)
+        await message.answer("❌ Ошибка при обработке голосового сообщения")
+
+@router.message(lambda message: message.audio is not None)
+async def handle_audio_file(message: Message):
+    """Обработчик аудио файлов"""
+    try:
+        # Получаем информацию о аудио файле
+        file_id = message.audio.file_id
+        file = await bot.get_file(file_id)
+        file_path = file.file_path
+        
+        # Формируем URL для скачивания файла
+        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        
+        logger.info(f"Processing audio file: {file_url}")
+        
+        # Отправляем на транскрибацию
+        await process_audio_transcription(message, file_url, "audio")
+        
+    except Exception as e:
+        logger.exception("Error processing audio file: %s", e)
+        await message.answer("❌ Ошибка при обработке аудио файла")
+
 
 async def poll_fallback(task_id: str, chat_id: int, timeout: int):
     """

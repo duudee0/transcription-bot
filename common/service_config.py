@@ -11,6 +11,8 @@ SERVICE_REGISTRY: Dict[str, str] = {
     "local-llm": "http://local-llm:8000", # Локальная модель
     "llm-service": "http://llm-service:8000", # Просто для теста
     "gigachat-service": "http://gigachat-service:8000", # гигачат
+    "whisper": "http://whisper:8000",
+    "transcribe_audio": "http://whisper:8000",
     # "image-service": "http://image-service:8000",
     # "voice-service": "http://voice-service:8000",
     # "worker": "http://worker:8080",

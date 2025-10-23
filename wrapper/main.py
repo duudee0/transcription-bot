@@ -40,6 +40,7 @@ SERVICE_CONFIGS = {
     "process_image": {"service_name": "image-service"},
     "local-llm": {"service_name": "local-llm"},
     "llm-service": {"service_name": "llm-service"},
+    "transcribe_audio": {"service_name": "whisper"},
 }
 # Задачи, которые должны проходить через несколько сервисов (последовательно)
 
@@ -54,6 +55,7 @@ MULTI_SERVICE_CHAINS = {
 ! ДОБАВИТЬ ОБРАБОТКУ ОШИБОК ДЛЯ ОТПРАВКИ КЛИЕНТУ ОШИБКИ
 ! НЕ ВЫДАВАТЬ ПОЛНЫЕ ОШИБКИ ТОЛЬКО КРАТКОЕ ИХ ОПИСАНИЕ 
 ! ПЕРЕРАБОТАТЬ ПОД ЭТО ОЧЕРЕДЬ RESULT НА ДРУГУЮ
+! ОТПРАВЛЯТЬ ВОРКЕРУ ЧТО ТАЙМАУТ ТОЖЕ ЛИБО ИЗМЕНИТЬ ЛОГИКУ
 
 """
 
@@ -159,7 +161,7 @@ async def create_task(task_request: TaskRequest, background_tasks: BackgroundTas
         if task_request.task_type in MULTI_SERVICE_CHAINS:
             target_services = MULTI_SERVICE_CHAINS[task_request.task_type]
             logger.info(f"🔗 Multi-service chain: {task_request.task_type} -> {target_services}")
-        else:
+        else: # TODO ОБЩИЙ КОНФИГ НАДО
             # single service: map task_type -> service_name from config
             svc_conf = SERVICE_CONFIGS.get(task_request.task_type)
             if not svc_conf:

@@ -1,0 +1,9 @@
+pydantic
+fastapi
+uvicorn
+httpx
+aio_pika
+
+# для того чтобы whisper работал из python кода 
+openai-whisper
+torch

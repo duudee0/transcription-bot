@@ -398,7 +398,9 @@ class BaseService:
                     execution_metadata={"error": True, "service": self.service_name}
                 )
             )
+            # Ошибку отправим сервис не смог справиться
             await self._send_webhook(callback_url, error_result)
+            await self._send_webhook_to_wrapper(task_message.data.wrapper_callback_url, error_result)
         
         finally:
             self.is_processing = False
