@@ -95,6 +95,13 @@ services:
       - "8005:8000"   # Новый порт для whisper service
     networks:
       - internal
+    volumes:
+      - ./services/whisper:/app
+      #- ./services/whisper:/app/common
+      #- ./services/whisper:/app:ro
+      - ./common/models.py:/app/common/models.py:ro
+      - ./common/publisher.py:/app/common/publisher.py:ro
+      - ./services/common/base_service.py:/app/common/base_service.py:ro
     deploy:
       resources:
         limits:

@@ -245,7 +245,7 @@ class BaseService:
                 target_services=remaining_services,
                 data= Data(
                     task_type=task_message.data.task_type,
-                    payload_type=task_message.data.payload_type,
+                    payload_type=result_data.payload_type if result_data.payload_type else task_message.data.payload_type,
                     payload=result_data.payload,
                     wrapper_callback_url=task_message.data.wrapper_callback_url,
                     original_message_id=task_message.data.original_message_id,

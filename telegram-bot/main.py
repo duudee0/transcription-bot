@@ -48,6 +48,7 @@ class TaskStates(StatesGroup):
     waiting_for_task_type = State()
     waiting_for_input_data = State()
     waiting_for_parameters = State()
+    waiting_voice_for_llm = State()
 
 # ---------- Инициализация aiogram ----------
 # Используем MemoryStorage для FSM (в продакшене лучше Redis)
@@ -370,7 +371,7 @@ async def handle_test1(message: Message):
 
     request = message.text.removeprefix("/ollama2")
     if not request:
-        await message.answer(f"Вы не передали команде запрос!")
+        await message.answer("Вы не передали команде запрос!")
         return
     
     chat_id = message.chat.id
@@ -594,7 +595,7 @@ async def process_audio_transcription(message: Message, audio_input: str, input_
     chat_id = message.chat.id
     
     if input_type == "url":
-        info_msg = await message.answer(f"🔄 Начинаю транскрибацию аудио по URL...")
+        info_msg = await message.answer("🔄 Начинаю транскрибацию аудио по URL...")
         task_type = "transcribe_audio"
         input_data = {"audio_url": audio_input}
     else:  # voice message
@@ -639,6 +640,76 @@ async def process_audio_transcription(message: Message, audio_input: str, input_
         f"✅ Задача транскрибации отправлена (ID: {task_id}).\n"
         f"Ожидаю результат..."
     )
+
+@router.message(Command("voice"))
+async def handle_voice_command(message: Message, state: FSMContext):
+    """
+    Обработчик команды /voice - начинает процесс создания задачи через FSM
+    """
+    await message.answer("🎵 Отправте голосовое сообщение",)
+    await state.set_state(TaskStates.waiting_voice_for_llm)
+
+@router.message(TaskStates.waiting_voice_for_llm)
+async def handle_voice(message: Message, state: FSMContext):
+    """Получаем parameters и создаем задачу"""
+
+    if not message.voice:
+        await message.answer("⚠️ Эта функция работает только с голосовыми сообщениями!")
+        return
+    
+    user_data = await state.get_data()
+    
+    # Создаем задачу
+    status_msg = await message.answer("Отправляю задачу...")
+
+    # Получаем информацию о файле голосового сообщения
+    file_id = message.voice.file_id
+    file = await bot.get_file(file_id)
+    file_path = file.file_path
+    
+    # Формируем URL для скачивания файла
+    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+    input_data = {"audio_url": file_url}
+
+    try:
+        wrapper_resp = await create_task_on_wrapper(
+            task_type="voice_question",
+            input_data=input_data,
+            parameters={"max_tokens": 80},
+            timeout=GLOBAL_TIMEOUT,
+            client_callback_url=CLIENT_CALLBACK_URL_FOR_WRAPPER
+        )
+    except Exception as e:
+        logger.exception("Failed to create task: %s", e)
+        await message.answer(f"Ошибка при создании задачи: {e}")
+        await state.clear()
+        return
+
+    task_id = _get_task_id_from_wrapper_response(wrapper_resp)
+    if not task_id:
+        await message.answer(f"Ответ без task_id: {wrapper_resp}")
+        await state.clear()
+        return
+
+    # Сохраняем mapping и мета
+    task_to_chats.setdefault(task_id, []).append(message.chat.id)
+    task_meta.setdefault(task_id, {}).update({
+        "type": "voice_question", 
+        "created_by": message.chat.id
+    })
+
+    await status_msg.edit_text(
+        f"Задача отправлена, task_id: {task_id}. "
+        f"Результат придёт сюда при callback от wrapper (push)."
+    )
+
+    # Запускаем polling fallback и сохраняем ссылку на задачу
+    polling_task = asyncio.create_task(poll_fallback(task_id, message.chat.id, GLOBAL_TIMEOUT))
+    polling_tasks[task_id] = polling_task
+    
+    await state.clear()
+    await message.answer("Что дальше?", reply_markup=make_main_keyboard())
+
 
 @router.message(lambda message: message.voice is not None)
 async def handle_voice_message(message: Message):

@@ -16,7 +16,7 @@ import secrets
 from common.models import PayloadType, Data, TaskMessage, ResultMessage, MessageType
 from common.models import TaskMessage, ResultMessage, Data ,MessageType
 from common.publisher import Publisher
-from common.service_config import get_service_url
+from common.service_config import get_chain_for_task, get_service_url
 
 RABBIT_URL = os.getenv("RABBIT_URL", "amqp://guest:guest@rabbitmq:5672/")
 WRAPPER_HOST = os.getenv("WRAPPER_HOST", "0.0.0.0")
@@ -32,24 +32,6 @@ logging.basicConfig(level=logging.INFO)
 # In-memory хранилище (в продакшене заменить на Redis)
 task_store = {}
 
-#TODO: ПОКА ЧТО ХАРДКОД ТАК УДОБНЕЕ ТЕСТИРОВАТЬ А ВООБЩЕ ДОБАВИТЬ НОРМ API ДЛЯ ТАКОГО
-# Конфигурация сервисов (аналогично воркеру)
-SERVICE_CONFIGS = {
-    "generate_response": {"service_name": "gigachat-service"},
-    "analyze_text": {"service_name": "llm-service"},
-    "process_image": {"service_name": "image-service"},
-    "local-llm": {"service_name": "local-llm"},
-    "llm-service": {"service_name": "llm-service"},
-    "transcribe_audio": {"service_name": "whisper"},
-}
-# Задачи, которые должны проходить через несколько сервисов (последовательно)
-
-MULTI_SERVICE_CHAINS = {
-    "comprehensive_analysis": ["llm-service", "gigachat-service"],
-    "text_to_speech": ["llm-service", "voice-service"], 
-    "content_creation": ["gigachat-service", "image-service"],
-    "full_processing": ["llm-service", "gigachat-service", "image-service"]
-}
 
 """
 ! ДОБАВИТЬ ОБРАБОТКУ ОШИБОК ДЛЯ ОТПРАВКИ КЛИЕНТУ ОШИБКИ
@@ -158,15 +140,17 @@ async def create_task(task_request: TaskRequest, background_tasks: BackgroundTas
     # determine target chain
     target_services = task_request.service_chain
     if not target_services:
-        if task_request.task_type in MULTI_SERVICE_CHAINS:
-            target_services = MULTI_SERVICE_CHAINS[task_request.task_type]
+        # Проверяем, есть ли цепочка для данного типа задачи
+        chain = get_chain_for_task(task_request.task_type)
+        if chain:
+            target_services = chain
             logger.info(f"🔗 Multi-service chain: {task_request.task_type} -> {target_services}")
-        else: # TODO ОБЩИЙ КОНФИГ НАДО
-            # single service: map task_type -> service_name from config
-            svc_conf = SERVICE_CONFIGS.get(task_request.task_type)
-            if not svc_conf:
+        else:
+            # Одиночный сервис: используем сопоставление task_type -> service_name
+            service_name = task_request.task_type
+            if not service_name:
                 raise HTTPException(status_code=400, detail="Unknown task_type and no service_chain provided")
-            target_services = [svc_conf["service_name"]]
+            target_services = [service_name]
 
     # security: generate per-task secret for internal webhook
     webhook_secret = secrets.token_urlsafe(16)

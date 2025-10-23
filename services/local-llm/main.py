@@ -76,6 +76,8 @@ class LocalModelService(BaseService):
 
     async def _validate_task(self, task_message: TaskMessage):
         """Валидация задачи для локального сервиса"""
+        print(f" Type message: {task_message.data.payload_type}")
+        
         if task_message.data.payload_type != PayloadType.TEXT:
             raise HTTPException(
                 status_code=400, 
