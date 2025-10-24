@@ -4,7 +4,7 @@ import asyncio
 import logging
 import httpx
 from aio_pika import IncomingMessage
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 
 from common.models import PayloadType, TaskMessage, ResultMessage, Data
@@ -14,15 +14,15 @@ logger = logging.getLogger("typed-worker.task-manager")
 WORKER_NAME = os.getenv("WORKER_NAME", "generic-worker")
 
 
-# TODO: ОПРЕДЕЛИТЬСЯ КАК МЫ БУДЕМ РАСПРЕДЕЛЯТЬ ГОТОВЫЕ ОТВЕТЫ
-async def send_to_result_queue(result_message: ResultMessage):
+# Выполняется если нету publisher'а
+def send_to_result_queue(result_message: ResultMessage):
     """Отправляет результат в очередь результатов (fallback)."""
-    # logger.info(f"📤 Would send result to queue: {result_message.data.original_message_id}")
-    # if result_message.data.success:
-    #     logger.info(f"✅ Task {result_message.data.original_message_id} completed successfully")
-    # else:
-    #     logger.error(f"❌ Task {result_message.data.original_message_id} failed: {result_message.error_message}")
-    pass
+    id_msg = result_message.data.original_message_id if  result_message.data.original_message_id else result_message.message_id
+    logger.info(f"📤 Would send result to queue: {id_msg}")
+    if result_message.success:
+        logger.info(f"✅ (no publisher) Task {id_msg} completed successfully")
+    else:
+        logger.error(f"❌ (no publisher) Task {id_msg} failed: {result_message.error_message}")
 
 @dataclass
 class AsyncTaskState:
@@ -66,52 +66,76 @@ class AsyncTaskManager:
         current_time = time.time()
         completed_tasks = []
         
-        # Будем итерировать копию ключей, чтобы безопасно модифицировать active_tasks внутри цикла
-        for task_id in list(self.active_tasks.keys()):
+        for task_id in [*self.active_tasks]:
             task_state = self.active_tasks.get(task_id)
             if not task_state:
                 continue
+            
             try:
-                # Пропускаем недавно созданные задачи
-                if current_time - task_state.start_time < 10:
-                    continue
-                    
-                # Проверяем таймаут
-                if current_time - task_state.start_time > self.max_wait_time:
-                    logger.warning(f"⏰ Task {task_id} timeout")
-                    await self._handle_task_timeout(task_id)
+                should_complete = await self._process_single_task(task_id, task_state, current_time)
+                if should_complete:
                     completed_tasks.append(task_id)
-                    continue
-                
-                # Проверяем статус сервиса
-                if not await self._is_service_alive(task_state.service_config):
-                    task_state.attempts += 1
-                    logger.warning(f"🚨 Service {task_state.service_config['service_name']} down for task {task_id} (attempts={task_state.attempts})")
-                    
-                    if task_state.attempts >= self.max_attempts:
-                        await self._handle_service_down(task_id)
-                        completed_tasks.append(task_id)
-                    continue
-                
-                # Если вебхук не пришел, проверяем статус задачи
-                if not task_state.callback_received:
-                    await self._check_task_status(task_id, task_state)
-                else:
-                    # вебхук пришёл — задача уже обработана в handle_webhook/_handle_task_completed
-                    completed_tasks.append(task_id)
-                    
             except Exception as e:
                 logger.error(f"❌ Error monitoring task {task_id}: {e}", exc_info=True)
-                task_state.attempts += 1
-                
-                if task_state.attempts >= self.max_attempts:
+                should_complete = await self._handle_task_monitoring_error(task_state)
+                if should_complete:
                     completed_tasks.append(task_id)
         
-        # Удаляем завершенные задачи (задачи уже финализированы в _finalize_task,
-        # но на всякий случай очищаем любую оставшуюся state)
+        self._cleanup_completed_tasks(completed_tasks)
+    
+    async def _process_single_task(self, task_id: str, task_state: AsyncTaskState, current_time: float) -> bool:
+        """Обрабатывает одну задачу и возвращает нужно ли её завершить"""
+        # Пропускаем недавно созданные задачи
+        if current_time - task_state.start_time < 10:
+            return False
+            
+        # Проверяем таймаут
+        if current_time - task_state.start_time > self.max_wait_time:
+            logger.warning(f"⏰ Task {task_id} timeout")
+            await self._handle_task_timeout(task_id)
+            return True
+        
+        # Проверяем статус сервиса
+        service_check_result = await self._check_service_health(task_id, task_state)
+        if service_check_result is not None:  # Сервис недоступен и задача завершена
+            return service_check_result
+        
+        # Если вебхук не пришел, проверяем статус задачи
+        if not task_state.callback_received:
+            return await self._check_task_progress(task_id, task_state, current_time)
+        else:
+            # вебхук пришёл — задача уже обработана в handle_webhook/_handle_task_completed
+            return True
+    
+    async def _check_service_health(self, task_id: str, task_state: AsyncTaskState) -> Optional[bool]:
+        """Проверяет здоровье сервиса и возвращает нужно ли завершить задачу"""
+        if await self._is_service_alive(task_state.service_config):
+            return None  # Сервис жив, продолжаем обработку
+        
+        task_state.attempts += 1
+        logger.warning(f"🚨 Service {task_state.service_config['service_name']} down for task {task_id} (attempts={task_state.attempts})")
+        
+        if task_state.attempts >= self.max_attempts:
+            await self._handle_service_down(task_id)
+            return True
+        
+        return False
+    
+    async def _check_task_progress(self, task_id: str, task_state: AsyncTaskState, current_time: float) -> bool:
+        """Проверяет прогресс задачи и возвращает нужно ли её завершить"""
+        task_state.last_check = current_time
+        await self._check_task_status(task_id, task_state)
+        return False  # Задача продолжает обрабатываться
+    
+    def _handle_task_monitoring_error(self, task_state: AsyncTaskState) -> bool:
+        """Обрабатывает ошибки мониторинга задачи и возвращает нужно ли её завершить"""
+        task_state.attempts += 1
+        return task_state.attempts >= self.max_attempts
+    
+    def _cleanup_completed_tasks(self, completed_tasks: List[str]):
+        """Очищает завершенные задачи из активного списка"""
         for task_id in completed_tasks:
             if task_id in self.active_tasks:
-                # _finalize_task уже должен был удалить, но удалим здесь безопасно
                 self.active_tasks.pop(task_id, None)
     
     async def _is_service_alive(self, service_config: Dict) -> bool:
@@ -195,7 +219,7 @@ class AsyncTaskManager:
             if self.publisher:
                 await self.publisher.publish_result(result_message)
             else:
-                await send_to_result_queue(result_message)
+                send_to_result_queue(result_message)
         except Exception as e:
             logger.exception(f"Failed to publish completed result for task {task_id}: {e}")
         finally:
@@ -227,7 +251,7 @@ class AsyncTaskManager:
             if self.publisher:
                 await self.publisher.publish_result(result_message)
             else:
-                await send_to_result_queue(result_message)
+                send_to_result_queue(result_message)
         except Exception as e:
             logger.exception(f"Failed to publish failed result for task {task_id}: {e}",)
         finally:
@@ -260,7 +284,7 @@ class AsyncTaskManager:
             if self.publisher:
                 await self.publisher.publish_result(result_message)
             else:
-                await send_to_result_queue(result_message)
+                send_to_result_queue(result_message)
         except Exception as e:
             logger.exception(f"Failed to publish timeout result for task {task_id}: {e}")
         finally:
@@ -292,7 +316,7 @@ class AsyncTaskManager:
             if self.publisher:
                 await self.publisher.publish_result(result_message)
             else:
-                await send_to_result_queue(result_message)
+                send_to_result_queue(result_message)
         except Exception as e:
             logger.exception(f"Failed to publish service-down result for task {task_id}: {e}")
         finally:
