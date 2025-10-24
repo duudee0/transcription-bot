@@ -1,0 +1,7 @@
+pydantic
+fastapi
+uvicorn
+httpx
+gigachat
+aio_pika
+openai

@@ -44,11 +44,25 @@ services:
       - GIGACHAT_MODEL=GigaChat
       - GIGACHAT_VERIFY_SSL=False
     ports:
-      - "8001:8000"   # Different port to avoid conflict
+      - "8006:8000"   # Different port to avoid conflict
     command: sh -c "sleep 7 && exec python main.py"
     networks:
       - internal
 
+  qwen:
+    build:
+      context: ./
+      dockerfile: services/qwen/Dockerfile
+    environment:
+      - PORT=8000
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - QWEN_MODEL=qwen/qwen3-30b-a3b:free
+      - QWEN_API_BASE=https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation
+    ports:
+      - "8001:8000"   # Different port to avoid conflict
+    command: sh -c "sleep 7 && exec python main.py"
+    networks:
+      - internal
 
   ollama:
     image: ollama/ollama:latest

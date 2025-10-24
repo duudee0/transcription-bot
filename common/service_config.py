@@ -13,6 +13,7 @@ SERVICE_REGISTRY: Dict[str, str] = {
     "gigachat-service": "http://gigachat-service:8000", # гигачат
     "whisper": "http://whisper:8000",
     "transcribe_audio": "http://whisper:8000",
+    "qwen": "http://qwen:8000"
 }
 
 MULTI_SERVICE_CHAINS = {
