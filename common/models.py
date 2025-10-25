@@ -20,9 +20,6 @@ import json
 """
 
 
-T = TypeVar("T")
-
-
 class PayloadType(str, Enum):
     """
     Типы входных/выходных данных для контейнеров.
@@ -47,7 +44,7 @@ class MessageType(str, Enum):
     STATUS = "status"      # Статус сервиса (health check, мониторинг)
 
 
-class BaseMessage(GenericModel, Generic[T]):
+class BaseMessage(BaseModel):
     """
     БАЗОВАЯ МОДЕЛЬ СООБЩЕНИЯ
     
@@ -71,8 +68,6 @@ class BaseMessage(GenericModel, Generic[T]):
     
     # Версия формата сообщения (для обратной совместимости)
     version: str = "2.0"
-
-    data: T
 
 
 class Data(BaseModel):
@@ -105,7 +100,7 @@ class Data(BaseModel):
     execution_metadata: Dict[str, Any] = Field(default_factory=dict)  # Пример: {"processing_time_ms": 150, "memory_used_mb": 128}
 
 
-class TaskMessage(BaseMessage[Data]):
+class TaskMessage(BaseMessage):
     """
     СООБЩЕНИЕ-ЗАДАЧА
     
@@ -119,7 +114,7 @@ class TaskMessage(BaseMessage[Data]):
     data: Data
 
 
-class ResultMessage(BaseMessage[Data]):
+class ResultMessage(BaseMessage):
     """
     СООБЩЕНИЕ-РЕЗУЛЬТАТ
     
