@@ -440,10 +440,6 @@ async def handle_message(msg: IncomingMessage, publisher: Publisher):
 
 @asynccontextmanager
 async def app_lifespan(app: FastAPI):
-    """
-    Запускает monitoring и AMQP consumer как background tasks. На shutdown
-    аккуратно отменяет таски и закрывает ресурсы.
-    """
     logger.info("LIFESPAN: startup — launching background tasks")
     monitor_task = asyncio.create_task(task_manager.start_monitoring(), name="task_manager_monitor")
     amqp_task = asyncio.create_task(_amqp_consumer_loop(app), name="amqp_consumer_loop")
@@ -456,21 +452,29 @@ async def app_lifespan(app: FastAPI):
     finally:
         logger.info("LIFESPAN: shutdown — cancelling background tasks")
 
-        # отменяем и ожидаем, при CancelledError — re-raise после очистки
+        # Отменяем AMQP consumer и ждём до 10 сек
         try:
-            await _cancel_task_and_maybe_reraise(getattr(app.state, "amqp_task", None), "amqp_consumer_loop")
-        except asyncio.CancelledError:
-            # повторно поднимаем чтобы uvicorn / внешний сигнал получили CancelledError
-            logger.info("Re-raising CancelledError after amqp cleanup")
-            raise
+            await _cancel_task_and_maybe_reraise(
+                getattr(app.state, "amqp_task", None),
+                "amqp_consumer_loop",
+                re_raise=False,
+                wait_timeout=10.0,
+            )
+        except Exception:
+            logger.exception("Unexpected error while cancelling amqp_consumer_loop")
 
+        # Отменяем монитор и ждём до 5 сек
         try:
-            await _cancel_task_and_maybe_reraise(getattr(app.state, "monitor_task", None), "task_manager_monitor")
-        except asyncio.CancelledError:
-            logger.info("Re-raising CancelledError after monitor cleanup")
-            raise
+            await _cancel_task_and_maybe_reraise(
+                getattr(app.state, "monitor_task", None),
+                "task_manager_monitor",
+                re_raise=False,
+                wait_timeout=5.0,
+            )
+        except Exception:
+            logger.exception("Unexpected error while cancelling task_manager_monitor")
 
-        # дополнительный guard: если publisher/connection всё ещё есть — закроем их
+        # Закрываем publisher/connection если остались
         pub = getattr(app.state, "publisher", None)
         if pub:
             try:
@@ -487,7 +491,7 @@ async def app_lifespan(app: FastAPI):
             except Exception:
                 logger.exception("Failed to close AMQP connection in lifespan shutdown")
 
-        # очистка state
+        # Очистка app.state
         for attr in ("publisher", "amqp_connection", "amqp_task", "monitor_task"):
             if hasattr(app.state, attr):
                 try:
@@ -625,7 +629,12 @@ async def _attempt_consume_loop(app: FastAPI):
 
 # === Управление отменой тасков: корректная обработка CancelledError ===
 
-async def _cancel_task_and_maybe_reraise(task: asyncio.Task, name: str):
+async def _cancel_task_and_maybe_reraise(
+    task: asyncio.Task,
+    name: str,
+    re_raise: bool = False,
+    wait_timeout: Optional[float] = None,
+):
     """
     Отменяет task, ждёт её завершения.
     Если при ожидании возник asyncio.CancelledError — логируем и повторно поднимаем.
@@ -633,13 +642,21 @@ async def _cancel_task_and_maybe_reraise(task: asyncio.Task, name: str):
     """
     if not task:
         return
+
     task.cancel()
     try:
-        await task
+        if wait_timeout is not None:
+            await asyncio.wait_for(task, timeout=wait_timeout)
+        else:
+            await task
+    except asyncio.TimeoutError:
+        logger.warning("%s did not finish within %s seconds after cancel()", name, wait_timeout)
     except asyncio.CancelledError:
-        logger.info("%s cancelled (propagating CancelledError)", name)
-        # Sonar требует: re-raise CancelledError after cleanup
-        raise
+        logger.info("%s cancelled", name)
+        if re_raise:
+            logger.info("%s cancelled (re-raising CancelledError as requested)", name)
+            raise
+        # иначе подавляем — это нормальное поведение при shutdown
     except Exception:
         logger.exception("%s raised during cancel/wait", name)
 

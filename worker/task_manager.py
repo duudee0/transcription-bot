@@ -17,11 +17,15 @@ WORKER_NAME = os.getenv("WORKER_NAME", "generic-worker")
 # Выполняется если нету publisher'а
 def send_to_result_queue(result_message: ResultMessage):
     """Отправляет результат в очередь результатов (fallback)."""
-    id_msg = result_message.data.original_message_id if  result_message.data.original_message_id else result_message.message_id
+    if result_message.data:
+        id_msg = result_message.data.original_message_id if result_message.data.original_message_id else result_message.message_id
+    else:
+        id_msg = False
+        
     logger.info(f"📤 Would send result to queue: {id_msg}")
     if result_message.success:
         logger.info(f"✅ (no publisher) Task {id_msg} completed successfully")
-    else:
+    else: 
         logger.error(f"❌ (no publisher) Task {id_msg} failed: {result_message.error_message}")
 
 @dataclass

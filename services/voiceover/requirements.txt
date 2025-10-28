@@ -1,0 +1,9 @@
+pydantic
+fastapi
+uvicorn
+httpx
+aiofiles
+aio_pika
+
+# Главная зависимость для XTTS-v2
+coqui-tts

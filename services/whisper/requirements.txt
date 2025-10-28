@@ -4,6 +4,7 @@ uvicorn
 httpx
 aio_pika
 aiofiles
+aiofiles
 
 # для того чтобы whisper работал из python кода 
 openai-whisper

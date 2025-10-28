@@ -22,3 +22,7 @@ venv.bak/
 rabbitmq/
 
 services/*/common/
+services/*/cache/
+services/*/audio_outputs/
+tts_cache
+audio_files

@@ -3,9 +3,12 @@ import os
 import asyncio
 import json
 import logging
+import tempfile
 from typing import Optional, Dict, Any, List, Set
 from contextlib import asynccontextmanager
+import uuid
 
+import aiofiles
 import httpx
 from aiogram import Bot, Dispatcher, Router
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
@@ -15,6 +18,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.types import FSInputFile
+
 
 # ---------- Конфигурация ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -283,24 +288,83 @@ async def client_webhook(request: Request):
         logger.info("No chat mapping for task %s (client webhook received)", task_id)
         return {"status": "no_mapping"}
 
-    # prepare message text
-    text = f"📬 Результат задачи {task_id}:\nStatus: {status}\n"
-    if error:
-        text += f"Error: {error}\n"
-    if result is not None:
-        pretty = json.dumps(result, ensure_ascii=False, indent=2)
-        pretty = _safe_truncate(pretty, 3500)
-        text += f"\nResult:\n<pre>{escape(pretty)}</pre>"
-
     # send messages asynchronously
     for chat_id in chats:
-        asyncio.create_task(bot.send_message(chat_id, text, parse_mode=ParseMode.HTML))
-        asyncio.create_task(bot.send_message(chat_id, f"🩷 Ответ: \r\n{result.get("text", "non text")}", 
-                                             parse_mode=ParseMode.HTML))
+        asyncio.create_task(_send_result_to_chat(chat_id, task_id, status or "unknown", result, error))
 
     # store last webhook for the task
     task_meta.setdefault(task_id, {})["last_webhook"] = payload
     return {"status": "delivered"}
+
+# --- Утилиты для скачивания и отправки результатов (вставьте рядом с другими утилитами) ---
+async def _download_file_to_temp(url: str, client: httpx.AsyncClient = None) -> str:
+    """
+    Скачивает URL в временный файл и возвращает путь к нему.
+    Бросает исключение при проблемах с загрузкой.
+    """
+    client = client or http_client
+    if client is None:
+        raise RuntimeError("HTTP client is not initialized")
+
+    temp_dir = tempfile.gettempdir()
+    filename = f"tgfile_{uuid.uuid4().hex}"
+    temp_path = os.path.join(temp_dir, filename)
+
+    async with client.stream("GET", url) as resp:
+        resp.raise_for_status()
+        async with aiofiles.open(temp_path, "wb") as f:
+            async for chunk in resp.aiter_bytes():
+                if not chunk:
+                    continue
+                await f.write(chunk)
+
+    return temp_path
+
+async def _send_result_to_chat(chat_id: int, task_id: str, status: str, result: Any, error: Any = None):
+    """
+    Универсальная логика отправки результата в один чат:
+      - если в result есть audio_url/file_url/url -> скачать и отправить как audio
+      - иначе отправить отладочный текст (pretty json)
+    """
+    try:
+        # Попробуем извлечь URL аудио из разных возможных полей
+        audio_url = None
+        if isinstance(result, dict):
+            for k in ("audio_url", "file_url", "url", "audio"):
+                if k in result and result[k]:
+                    audio_url = result[k]
+                    break
+
+        if audio_url:
+            try:
+                tmp = await _download_file_to_temp(audio_url)
+                # Отправляем файл как audio. Telegram определит формат.
+                try:
+                    await bot.send_audio(chat_id, FSInputFile(tmp), caption=f"🎧 Результат задачи {escape(task_id)} (status={escape(status)})")
+                except Exception:
+                    # Если send_audio не сработал, пробуем send_document
+                    await bot.send_document(chat_id, FSInputFile(tmp), caption=f"Файл для задачи {escape(task_id)} (status={escape(status)})")
+                finally:
+                    # Убираем временный файл
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+                return
+            except Exception as e:
+                # Если загрузка/отправка аудио упала — отправим отладочный текст и ссылку
+                logger.exception("Failed to download/send audio from %s: %s", audio_url, e)
+                await bot.send_message(chat_id, f"⚠️ Не удалось скачать/отправить аудио по URL: {audio_url}\nОшибка: {e}\nОтправляю отладочный текст для задачи {task_id}.")
+
+        # Если сюда дошли — отправляем текстовый результат (отладочно)
+        pretty = json.dumps(result, ensure_ascii=False, indent=2) if result is not None else "None"
+        pretty = _safe_truncate(pretty, 3500)
+        await bot.send_message(chat_id, f"📬 Результат задачи {escape(task_id)}:\nStatus: {escape(status)}\n\n<pre>{escape(pretty)}</pre>", parse_mode=ParseMode.HTML)
+
+        if error:
+            await bot.send_message(chat_id, f"Ошибка: {escape(str(error))}")
+    except Exception as e:
+        logger.exception("Unexpected error while sending result to chat %s: %s", chat_id, e)
 
 # ---------- Обработчики Telegram (aiogram) ----------
 @router.message(CommandStart())
