@@ -1,298 +1,275 @@
+# xtts_silero_pkg_service.py
 import os
 import uuid
-import tempfile
-import functools
 import asyncio
+import functools
 from pathlib import Path
 from typing import Optional
 
-import aiofiles
 import httpx
+import aiofiles
 from fastapi import HTTPException
 from fastapi.staticfiles import StaticFiles
 
-# Импорты ваших общих модулей — убедитесь, что пути верны в вашем проекте
+# Требуемый официальный пакет — silero-tts
+# Точная точка импорта может зависеть от версии пакета; этот импорт работает для распространённых релизов.
+# Если у вас другой пакет-нейм, замените на корректный (но пакет silero-tts должен быть установлен).
+from silero_tts.silero_tts import SileroTTS
+
+
+# Ваши общие модули (не менять)
 from common.base_service import BaseService
 from common.models import PayloadType, TaskMessage, Data
 
-# TTS
-from TTS.api import TTS
+# Конфиг (env)
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/app/audio_outputs"))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+SERVICE_BASE_URL = os.getenv("SERVICE_BASE_URL", "http://localhost:8000")
+DEFAULT_LANGUAGE = os.getenv("SILERO_DEFAULT_LANGUAGE", "ru").lower()
+DEFAULT_RU_SPEAKER = os.getenv("SILERO_RU_SPEAKER", "xenia")
+DEFAULT_EN_SPEAKER = os.getenv("SILERO_EN_SPEAKER", "bengali_male")
+USE_CUDA = os.getenv("USE_CUDA", "False").lower() == "true"
+DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "60"))
+XTTS_TIMEOUT = int(os.getenv("XTTS_TIMEOUT", "300"))
+
+# HTTP client for downloads (kept for parity)
+_client = httpx.AsyncClient(timeout=XTTS_TIMEOUT)
 
 
-class XTTSv2Service(BaseService):
+class SileroService(BaseService):
     """
-    XTTS-v2 Service (updated):
-      - configurable model via TTS_MODEL_NAME
-      - optional DEFAULT_SPEAKER_PATH for a fallback speaker WAV
-      - safe blocking-call handling via run_in_executor + functools.partial
-      - safe HTTP client close (close() method) and synchronous __del__
+    Minimal Silero TTS service using official pip package 'silero-tts'.
+    - only silero-tts used (no torch imports here)
+    - default language: ru
+    - optional payload field 'speaker' to select named speaker (if model supports)
     """
 
     def __init__(self):
-        super().__init__("xtts-v2-service", "1.0")
+        super().__init__("xtts-v2-service-silero-pkg", "1.0")
 
-        # --- Config ---
-        self.use_cuda = os.getenv("USE_CUDA", "False").lower() == "true"
-        self.output_dir = Path(os.getenv("OUTPUT_DIR", "/app/audio_outputs"))
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir = OUTPUT_DIR
+        self.service_base_url = SERVICE_BASE_URL
+        self.timeout = XTTS_TIMEOUT
+        self.download_timeout = DOWNLOAD_TIMEOUT
 
-        self.service_base_url = os.getenv("SERVICE_BASE_URL", "http://localhost:8000")
-        self.timeout = int(os.getenv("XTTS_TIMEOUT", "300"))
-        self.download_timeout = int(os.getenv("DOWNLOAD_TIMEOUT", "60"))
-
-        # HTTP async client for downloads
-        self.client = httpx.AsyncClient(timeout=self.timeout)
-
-        # Mount static files if BaseService provides self.app (FastAPI)
+        # mount static files if BaseService provides FastAPI app
         try:
             self.app.mount("/audio", StaticFiles(directory=self.output_dir), name="audio")
-            print(f"✅ Mounted static audio directory at /audio (serving from {self.output_dir})")
+            print(f"✅ Mounted /audio -> {self.output_dir}")
         except AttributeError:
-            print("⚠️ Warning: 'self.app' not found in BaseService. StaticFiles not mounted automatically.")
+            print("⚠️ BaseService has no self.app; static /audio not auto-mounted")
 
-        # Model selection (env)
-        self.model_name = os.getenv("TTS_MODEL_NAME", "tts_models/en/vctk/vits")
-        # Default local speaker WAV (optional). If file not found -> None (use model default)
-        self.default_speaker_path = os.getenv("DEFAULT_SPEAKER_PATH", "/app/default_speakers/default_speaker.wav")
-        if not self.default_speaker_path or not os.path.exists(self.default_speaker_path):
-            # If the expected file isn't present, we won't fail; we'll use model default voice.
-            self.default_speaker_path = None
-
-        # Load model
-        print(f"🔄 Loading TTS model '{self.model_name}' (gpu={self.use_cuda}) ...")
-        try:
-            self.model = TTS(self.model_name, gpu=self.use_cuda)
-
-            if hasattr(self.model, "speakers"):
-                print("Available speakers:", getattr(self.model, "speakers"))
-            else:
-                print("Model does not expose 'speakers' list")
-
-        except FileNotFoundError as e:
-            # Typical cause: missing system phonemizer (espeak/espeak-ng)
-            msg = (
-                f"TTS model init failed: {e}\n"
-                "Likely missing system phonemizer backend (espeak or espeak-ng).\n"
-                "Install espeak-ng/espeak in the container (e.g. apt-get install espeak-ng) "
-                "or choose a model that doesn't require external phonemizer."
-            )
-            print("❌", msg)
-            # re-raise as RuntimeError so container fails early and logs show the cause
-            raise RuntimeError(msg) from e
-        except Exception as e:
-            print("❌ Failed to initialize TTS model:", e)
-            raise
-
-        print(f"✅ TTS model '{self.model_name}' loaded successfully")
+        # cache SileroTTS instances per language
+        self._tts_objects = {}  # lang -> SileroTTS instance
 
     # ---------------------------
-    # Public helpers / framework hooks
+    # BaseService API (preserved)
     # ---------------------------
     def _can_handle_task_type(self, task_type: str) -> bool:
-        supported = {"text_to_speech", "generate_audio", "tts_generation"}
-        return task_type in supported
+        return task_type in {"text_to_speech", "generate_audio", "tts_generation"}
 
     def _health_handler(self):
         return {
             "status": "ok",
             "service": self.service_name,
-            "model": self.model_name,
-            "model_loaded": self.model is not None,
-            "cuda_enabled": self.use_cuda,
+            "default_language": DEFAULT_LANGUAGE,
+            "models_cached": list(self._tts_objects.keys()),
         }
 
-    # ---------------------------
-    # Validation / processing
-    # ---------------------------
     async def _validate_task(self, task_message: TaskMessage):
-        """Validate incoming task. 'speaker_audio_url' is optional (fallback used if absent)."""
         if task_message.data.payload_type != PayloadType.TEXT:
-            txt = f"Unsupported payload type: {task_message.data.payload_type}. Expected TEXT"
-            print(txt)
-            raise HTTPException(status_code=400, detail=txt)
-
+            raise HTTPException(status_code=400, detail="Unsupported payload_type (expected TEXT)")
         if "text" not in task_message.data.payload:
-            txt = "'text' is required in payload"
-            print(txt)
-            raise HTTPException(status_code=400, detail=txt)
-
-        # NOTE: speaker_audio_url is optional. If you need strict voice cloning, validate presence here.
+            raise HTTPException(status_code=400, detail="'text' is required in payload")
 
     async def _process_task_logic(self, task_message: TaskMessage) -> Data:
-        """Process the text -> speech task and return Data with audio URL."""
-        text_to_speak = task_message.data.payload.get("text")
-        speaker_source = task_message.data.payload.get("speaker_audio_url")  # may be None
-        language = task_message.data.payload.get("language", "ru")
+        text = task_message.data.payload.get("text")
+        language = (task_message.data.payload.get("language") or DEFAULT_LANGUAGE).lower()
+        speaker = task_message.data.payload.get("speaker")  # optional named speaker
+        speaker_audio_url = task_message.data.payload.get("speaker_audio_url")  # ignored (no cloning)
 
-        # If not provided, try default speaker file (if available)
-        if not speaker_source and self.default_speaker_path:
-            speaker_source = self.default_speaker_path
+        if speaker_audio_url:
+            # честно: silero-tts wrapper не делает one-shot cloning — логируем
+            print("⚠️ speaker_audio_url provided but voice cloning is not supported; ignoring.")
 
-        generated_audio_url = await self._generate_audio(
-            text=text_to_speak,
-            speaker_audio_url=speaker_source,
-            language=language,
-        )
-
-        # Return payload. Use AUDIO_URL if your Data/PayloadType supports it; if not, switch to AUDIO.
+        audio_url = await self._generate_audio(text=text, language=language, speaker=speaker)
         return Data(
             payload_type=PayloadType.AUDIO,
             payload={
                 "task": "tts_generation",
-                "audio_url": generated_audio_url,
-                "original_text": text_to_speak,
-                "model_used": self.model_name,
+                "audio_url": audio_url,
+                "original_text": text,
+                "model_used": "silero-tts (pip)",
                 "language": language,
             },
-            execution_metadata={
-                "task_type": "text_to_speech",
-                "service": self.service_name,
-                "model": self.model_name,
-            },
+            execution_metadata={"task_type": "text_to_speech", "service": self.service_name},
         )
 
     # ---------------------------
-    # Internal: generate / download
+    # Internal: create/get SileroTTS instance
     # ---------------------------
-    async def _generate_audio(self, text: str, speaker_audio_url: Optional[str], language: str) -> str:
+    def _get_or_create_tts(self, language: str, speaker: Optional[str]):
         """
-        Generate audio file and return public URL.
-
-        speaker_audio_url can be:
-          - HTTP/HTTPS URL -> will be downloaded temporarily
-          - local filesystem path -> used as-is
-          - None -> model default speaker (speaker_wav=None)
+        Создаёт и кеширует SileroTTS объект для указанного языка.
+        Явно передаём sample_rate (по умолчанию 24000) — это устраняет ошибку "Sample rate None is not supported".
+        Можно переопределить через переменные окружения:
+        SILERO_SAMPLE_RATE_RU, SILERO_SAMPLE_RATE_EN
         """
-        temp_speaker_file = None
-        speaker_wav_for_model = None
+        lang = language.split("_")[0]
+        if lang in self._tts_objects:
+            return self._tts_objects[lang]
 
+        chosen_speaker = speaker or (DEFAULT_RU_SPEAKER if lang.startswith("ru") else DEFAULT_EN_SPEAKER)
+
+        # выбор sample_rate: сначала ENV, иначе безопасный дефолт 24000
         try:
-            # Determine speaker_wav_for_model
-            if speaker_audio_url:
-                if isinstance(speaker_audio_url, str) and speaker_audio_url.startswith(("http://", "https://")):
-                    temp_speaker_file = await self._download_audio(speaker_audio_url)
-                    speaker_wav_for_model = temp_speaker_file
-                elif os.path.exists(speaker_audio_url):
-                    speaker_wav_for_model = speaker_audio_url
-                else:
-                    # Unknown / invalid path -> log and fallback to model default
-                    print(f"⚠️ Speaker source not found or unsupported: {speaker_audio_url}. Using model default voice.")
-                    speaker_wav_for_model = None
+            if lang.startswith("ru"):
+                sample_rate = int(os.getenv("SILERO_SAMPLE_RATE_RU", "24000"))
+            elif lang.startswith("en"):
+                sample_rate = int(os.getenv("SILERO_SAMPLE_RATE_EN", "24000"))
             else:
-                speaker_wav_for_model = None
+                sample_rate = int(os.getenv("SILERO_SAMPLE_RATE", "24000"))
+        except Exception:
+            sample_rate = 24000
 
-            # Prepare output path
-            output_filename = f"tts_{uuid.uuid4().hex}.wav"
-            output_filepath = self.output_dir / output_filename
-
-            # Use functools.partial to pass named args into run_in_executor
-            func = functools.partial(
-                self.model.tts_to_file,
-                text,
-                speaker='p225', #speaker_wav_for_model,
-                #language=language,
-                file_path=str(output_filepath),
-            )
-
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, func)
-
-            # Make public URL (StaticFiles mount must be configured in the service/run env)
-            public_url = f"{self.service_base_url.rstrip('/')}/audio/{output_filename}"
-            return public_url
-
-        except Exception as e:
-            # Bubble up as HTTPException so caller sees reasonable status
-            raise HTTPException(status_code=500, detail=f"TTS generation failed: {str(e)}")
-        finally:
-            # Cleanup downloaded temp file if present
-            if temp_speaker_file and os.path.exists(temp_speaker_file):
-                try:
-                    os.unlink(temp_speaker_file)
-                except Exception:
-                    pass
-
-    async def _download_audio(self, audio_url: str) -> str:
-        """Download audio to temp file and return local path."""
+        # попытка получить актуальный model_id (если пакет это поддерживает)
         try:
-            temp_dir = tempfile.gettempdir()
-            temp_filename = f"tts_speaker_{uuid.uuid4().hex}.audio"
-            temp_filepath = os.path.join(temp_dir, temp_filename)
+            model_id = SileroTTS.get_latest_model(lang)
+        except Exception:
+            model_id = None
 
-            async with self.client.stream("GET", audio_url, timeout=self.download_timeout) as response:
-                response.raise_for_status()
+        kwargs = {
+            "model_id": model_id or ("v5_ru" if lang.startswith("ru") else "v3_en"),
+            "language": lang,
+            "speaker": chosen_speaker,
+            "sample_rate": sample_rate,
+            "device": "cuda" if USE_CUDA else "cpu",
+        }
+
+        # Создаём экземпляр (в некоторых версиях сигнатура может чуть отличаться)
+        try:
+            tts = SileroTTS(**kwargs)
+        except TypeError:
+            # на случай другой сигнатуры: пробуем минимальный набор аргументов
+            tts = SileroTTS(model_id=kwargs["model_id"], language=kwargs["language"], speaker=kwargs["speaker"],
+                            sample_rate=kwargs["sample_rate"], device=kwargs["device"])
+
+        self._tts_objects[lang] = tts
+        print(f"✅ silero-tts instance created for lang={lang}, model_id={kwargs['model_id']}, speaker={chosen_speaker}, sr={sample_rate}")
+        return tts
+    # ---------------------------
+    # Internal: generate audio (uses SileroTTS.tts synchronously inside executor)
+    # ---------------------------
+    async def _generate_audio(self, text: str, language: str, speaker: Optional[str] = None) -> str:
+        # create or reuse silero object
+        tts_obj = self._get_or_create_tts(language, speaker)
+
+        # output file
+        out_filename = f"tts_{uuid.uuid4().hex}.wav"
+        out_path = str(self.output_dir / out_filename)
+
+        # The SileroTTS API commonly provides a method `tts(text, out_path)` or similar.
+        # We'll call `.tts()` inside a thread to avoid blocking event loop.
+
+        def _sync_tts_call():
+            # try common method names / signatures for widest compatibility
+            # 1) preferred: tts_obj.tts(text, out_path)
+            try:
+                tts_obj.tts(text, out_path)
+                return
+            except TypeError:
+                pass
+            except Exception as e:
+                # for unexpected errors, re-raise to be caught below
+                raise
+
+            # 2) alternative signature: tts(text=text, file=out_path) or save
+            try:
+                tts_obj.tts(text=text, file=out_path)
+                return
+            except Exception:
+                pass
+
+            # 3) some wrappers provide save() or synthesize()
+            for alt in ("synthesize", "synth", "save", "speak"):
+                fn = getattr(tts_obj, alt, None)
+                if callable(fn):
+                    try:
+                        # try common signatures
+                        try:
+                            fn(text, out_path)
+                        except TypeError:
+                            fn(text=text, out_path=out_path)
+                        return
+                    except Exception:
+                        continue
+
+            # if we get here — no known callable worked
+            raise RuntimeError("Unable to call SileroTTS.tts with current package version. Check silero-tts API.")
+
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(None, functools.partial(_sync_tts_call))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"silero-tts synthesis failed: {e}")
+
+        public_url = f"{self.service_base_url.rstrip('/')}/audio/{out_filename}"
+        return public_url
+
+    # ---------------------------
+    # Optional helper: download audio (kept for parity)
+    # ---------------------------
+    async def _download_audio(self, audio_url: str) -> str:
+        temp_dir = Path(os.getenv("TMPDIR", "/tmp"))
+        temp_filename = f"tts_speaker_{uuid.uuid4().hex}.audio"
+        temp_filepath = str(temp_dir / temp_filename)
+        try:
+            async with _client.stream("GET", audio_url, timeout=self.download_timeout) as r:
+                r.raise_for_status()
                 async with aiofiles.open(temp_filepath, "wb") as f:
-                    async for chunk in response.aiter_bytes():
+                    async for chunk in r.aiter_bytes():
                         if not chunk:
                             continue
                         await f.write(chunk)
-
             return temp_filepath
-
         except httpx.RequestError as e:
-            txt = f"Failed to download speaker audio from URL: {str(e)}"
-            print(txt)
-            raise HTTPException(status_code=400, detail=txt)
+            raise HTTPException(status_code=400, detail=f"Failed to download speaker audio: {e}")
 
     # ---------------------------
     # Close resources
     # ---------------------------
     async def close(self):
-        """Асинхронно закрывает HTTP клиента (вызывайте при controlled shutdown)."""
         try:
-            if getattr(self, "client", None):
-                await self.client.aclose()
+            await _client.aclose()
         except Exception:
             pass
 
     def __del__(self):
-        """
-        Синхронный финализатор — стараемся аккуратно закрыть httpx клиент.
-        Не делаем async __del__ (оно не awaited Python'ом).
-        """
         try:
-            client = getattr(self, "client", None)
-            if not client:
-                return
-
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = None
+        if loop and loop.is_running():
             try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = None
-
-            if loop and loop.is_running():
-                # планируем закрытие в текущем loop (не блокируем)
-                try:
-                    asyncio.create_task(client.aclose())
-                except Exception:
-                    pass
-            else:
-                # создаём временный loop и закрываем синхронно
-                try:
-                    new_loop = asyncio.new_event_loop()
-                    new_loop.run_until_complete(client.aclose())
-                    new_loop.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                asyncio.create_task(_client.aclose())
+            except Exception:
+                pass
+        else:
+            try:
+                new_loop = asyncio.new_event_loop()
+                new_loop.run_until_complete(_client.aclose())
+                new_loop.close()
+            except Exception:
+                pass
 
 
-# ---------------------------
-# Script entrypoint
-# ---------------------------
-# Создаём сервис (при импорте модуля создастся экземпляр)
-service = XTTSv2Service()
-
+# создаём сервис (как в вашей структуре)
+service = SileroService()
 
 if __name__ == "__main__":
-    # BaseService.run() — оставляем поведение как у вас было (предполагается синхронный запуск).
-    # Если BaseService.run() блокирует и контролирует lifecycle, оно должно
-    # вызывать service.close() при остановке; если нет — можно ловить KeyboardInterrupt.
     try:
         service.run()
     except KeyboardInterrupt:
-        # Попытка корректно закрыть
         try:
             asyncio.run(service.close())
         except Exception:

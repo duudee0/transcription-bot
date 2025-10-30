@@ -5,5 +5,12 @@ httpx
 aiofiles
 aio_pika
 
+# Для Silero
+torch
+numpy 
+omegaconf 
+num2words
+scipy
+
 # Главная зависимость для XTTS-v2
-coqui-tts
+#coqui-tts
