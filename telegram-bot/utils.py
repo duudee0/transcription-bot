@@ -35,7 +35,7 @@ def format_task_status(task) -> str:
         f"{icon} <b>Задача #{task.task_id[:8]}</b>\n"
         f"📊 Тип: {task.task_type}\n"
         f"🔗 Цепочка: {service_chain}\n" 
-        f"📈 Статус: {task.status.value}\n"
+        f"📈 Статус: {task.status}\n"
         f"🕐 Создана: {task.created_at.strftime('%H:%M:%S')}\n"
     )
 

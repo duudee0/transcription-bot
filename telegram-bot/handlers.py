@@ -1,29 +1,28 @@
-from datetime import datetime
+"""Обработчики Telegram бота."""
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 
-from config import config
+from config import config, TextCommands
 from models import TaskCreationState, ServiceSelectionState
-from services import task_manager
+from dependencies import ServiceContainer, get_task_manager
 from keyboards import (
     get_main_keyboard, get_llm_service_keyboard, 
     get_audio_service_keyboard, get_service_chain_keyboard,
     get_cancel_keyboard
 )
-from utils import get_task_type_by_name, validate_json, validate_text_length
+from utils import (
+    get_task_type_by_name, validate_json, 
+    validate_text_length, format_task_status
+)
 
 
 router = Router()
 
 
-# ===== COMMAND HANDLERS =====
-@router.message(CommandStart())
-async def handle_start(message: Message, state: FSMContext):
-    """Обработчик команды /start."""
-    await state.clear()
-    
+async def _send_welcome_message(message: Message) -> None:
+    """Отправляет приветственное сообщение."""
     welcome_text = (
         "🤖 <b>Добро пожаловать в AI Assistant!</b>\n\n"
         "Я могу обрабатывать текст и аудио через различные AI сервисы.\n"
@@ -40,9 +39,8 @@ async def handle_start(message: Message, state: FSMContext):
     await message.answer(welcome_text, reply_markup=get_main_keyboard())
 
 
-@router.message(Command("help"))
-async def handle_help(message: Message):
-    """Обработчик команды /help."""
+async def _send_help_message(message: Message) -> None:
+    """Отправляет сообщение помощи."""
     help_text = (
         "🆘 <b>Помощь по использованию бота</b>\n\n"
         "<b>Основные команды:</b>\n"
@@ -61,39 +59,59 @@ async def handle_help(message: Message):
     await message.answer(help_text)
 
 
+@router.message(CommandStart())
+async def handle_start(message: Message, state: FSMContext) -> None:
+    """Обработчик команды /start."""
+    await state.clear()
+    await _send_welcome_message(message)
+
+
+@router.message(Command("help"))
+@router.message(F.text == TextCommands.HELP)
+async def handle_help(message: Message) -> None:
+    """Обработчик команды /help."""
+    await _send_help_message(message)
+
+
 @router.message(Command("tasks"))
-async def handle_tasks(message: Message):
+@router.message(F.text == TextCommands.MY_TASK)
+async def handle_tasks(message: Message) -> None:
     """Показывает задачи пользователя."""
-    tasks = task_manager.get_user_tasks(message.from_user.id)
-    
-    if not tasks:
-        await message.answer("📭 У вас нет активных задач.")
-        return
-    
-    text = "📋 <b>Ваши задачи:</b>\n\n"
-    for task in tasks[-5:]:  # Последние 5 задач
-        from utils import format_task_status
-        text += format_task_status(task) + "\n\n"
-    
-    await message.answer(text)
+    try:
+        task_manager = get_task_manager()
+        tasks = task_manager.get_user_tasks(message.from_user.id)
+        
+        if not tasks:
+            await message.answer("📭 У вас нет активных задач.")
+            return
+        
+        text = "📋 <b>Ваши задачи:</b>\n\n"
+        for task in tasks[-5:]:  # Последние 5 задач
+            text += format_task_status(task) + "\n\n"
+        
+        await message.answer(text)
+    except RuntimeError as error:
+        await message.answer(f"❌ Сервис временно недоступен: {error}")
 
 
 @router.message(Command("cancel"))
-@router.message(F.text == "❌ Отмена")
-async def handle_cancel(message: Message, state: FSMContext):
+@router.message(F.text == TextCommands.CANCEL)
+async def handle_cancel(message: Message, state: FSMContext) -> None:
     """Отмена текущей операции."""
     current_state = await state.get_state()
     if current_state is None:
-        await message.answer("ℹ️ Нет активных операций для отмены.", reply_markup=get_main_keyboard())
+        await message.answer(
+            "ℹ️ Нет активных операций для отмены.", 
+            reply_markup=get_main_keyboard()
+        )
         return
     
     await state.clear()
     await message.answer("❌ Операция отменена.", reply_markup=get_main_keyboard())
 
 
-# ===== TASK SELECTION HANDLERS =====
 @router.message(F.text.in_([task["name"] for task in config.TASK_TYPES.values()]))
-async def handle_task_selection(message: Message, state: FSMContext):
+async def handle_task_selection(message: Message, state: FSMContext) -> None:
     """Обработчик выбора типа задачи."""
     task_name = message.text
     task_type = get_task_type_by_name(task_name)
@@ -138,9 +156,8 @@ async def handle_task_selection(message: Message, state: FSMContext):
         )
 
 
-# ===== SERVICE SELECTION HANDLERS =====
 @router.callback_query(ServiceSelectionState.selecting_llm, F.data.startswith("service_llm:"))
-async def handle_llm_selection(callback: CallbackQuery, state: FSMContext):
+async def handle_llm_selection(callback: CallbackQuery, state: FSMContext) -> None:
     """Обработчик выбора LLM сервиса."""
     service_id = callback.data.split(":")[1]
     service_name = config.LLM_SERVICES[service_id]
@@ -157,7 +174,7 @@ async def handle_llm_selection(callback: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(ServiceSelectionState.building_chain, F.data.startswith("chain_"))
-async def handle_chain_building(callback: CallbackQuery, state: FSMContext):
+async def handle_chain_building(callback: CallbackQuery, state: FSMContext) -> None:
     """Обработчик построения цепочки сервисов."""
     action = callback.data.split(":")[0]
     
@@ -208,10 +225,16 @@ async def handle_chain_building(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
 
 
-# ===== INPUT HANDLERS =====
 @router.message(TaskCreationState.waiting_for_input, F.text)
-async def handle_text_input(message: Message, state: FSMContext):
+async def handle_text_input(message: Message, state: FSMContext) -> None:
     """Обработка текстового ввода."""
+    try:
+        task_manager = get_task_manager()
+    except RuntimeError as error:
+        await message.answer(f"❌ Сервис временно недоступен: {error}")
+        await state.clear()
+        return
+    
     if not validate_text_length(message.text):
         await message.answer("❌ Текст слишком длинный. Максимум 4000 символов.")
         return
@@ -238,7 +261,6 @@ async def handle_text_input(message: Message, state: FSMContext):
             service_chain=service_chain
         )
         
-        from utils import format_task_status
         status_text = format_task_status(user_task)
         
         await message.answer(
@@ -246,9 +268,9 @@ async def handle_text_input(message: Message, state: FSMContext):
             reply_markup=get_main_keyboard()
         )
         
-    except Exception as e:
+    except Exception as error:
         await message.answer(
-            f"❌ <b>Ошибка при создании задачи:</b>\n{str(e)}",
+            f"❌ <b>Ошибка при создании задачи:</b>\n{str(error)}",
             reply_markup=get_main_keyboard()
         )
     
@@ -256,21 +278,76 @@ async def handle_text_input(message: Message, state: FSMContext):
 
 
 @router.message(TaskCreationState.waiting_for_input, F.voice)
-async def handle_voice_input(message: Message, state: FSMContext):
+async def handle_voice_input(message: Message, state: FSMContext) -> None:
     """Обработка голосового сообщения."""
-    # Здесь будет логика обработки аудио
-    # Пока заглушка
+    try:
+        task_manager = get_task_manager()
+    except RuntimeError as error:
+        await message.answer(f"❌ Сервис временно недоступен: {error}")
+        await state.clear()
+        return
+    
     await message.answer(
         "🎤 <b>Голосовое сообщение получено</b>\n\n"
         "Обработка аудио в разработке...",
         reply_markup=get_main_keyboard()
     )
+
+    user_data = await state.get_data()
+    task_type = user_data["task_type"]
+    task_config = user_data["task_config"]
+
+    if task_config.get("is_chain"):
+        service_chain = config.SERVICE_CHAINS.get(task_type, [])
+    elif "service_chain" in user_data:
+        service_chain = user_data["service_chain"]
+    elif user_data:
+        service_chain = [user_data["selected_service"]]
+    else:
+        service = config.TASK_TYPES.get("voice_transcription").get("default_service")
+        service_chain = [service]
+        task_type = service
+
+    file_id = message.voice.file_id
+
+    # Получаем сервисы через контейнер
+    container = ServiceContainer.get_instance()
+    if container.task_manager is None:
+        print("❌ Task manager not available") 
+           
+    file = await container.bot.get_file(file_id)
+    file_path = file.file_path
+    
+    # Формируем URL для скачивания файла
+    file_url = f"https://api.telegram.org/file/bot{config.TELEGRAM_TOKEN}/{file_path}"
+
+    # Создаем задачу
+    try:
+        user_task = await task_manager.create_task(
+            user_id=message.from_user.id,
+            chat_id=message.chat.id,
+            task_type=task_type,
+            input_data={"audio_url": file_url},
+            service_chain=service_chain
+        )
+        
+        status_text = format_task_status(user_task)
+        
+        await message.answer(
+            status_text,
+            reply_markup=get_main_keyboard()
+        )
+        
+    except Exception as error:
+        await message.answer(
+            f"❌ <b>Ошибка при создании задачи:</b>\n{str(error)}",
+            reply_markup=get_main_keyboard()
+        )
     await state.clear()
 
 
-# ===== FALLBACK HANDLER =====
 @router.message()
-async def handle_unknown(message: Message):
+async def handle_unknown(message: Message) -> None:
     """Обработчик неизвестных сообщений."""
     await message.answer(
         "🤔 <b>Не понял ваше сообщение</b>\n\n"

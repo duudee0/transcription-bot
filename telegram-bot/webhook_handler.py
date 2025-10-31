@@ -1,22 +1,25 @@
+"""Webhook handler для приема callback от Wrapper."""
 from fastapi import FastAPI, Request, HTTPException
-from aiogram import Bot
 from datetime import datetime
 
 from config import config
-from services import task_manager
+from dependencies import ServiceContainer
 from utils import format_task_result
 
 
 class WebhookHandler:
-    def __init__(self, bot: Bot):
-        self.bot = bot
+    """Обработчик вебхуков от Wrapper API."""
+    
+    def __init__(self):
         self.app = FastAPI()
         self._setup_routes()
     
-    def _setup_routes(self):
+    def _setup_routes(self) -> None:
+        """Настройка маршрутов FastAPI."""
+        
         @self.app.post("/client/webhook/{user_id}")
-        async def handle_wrapper_webhook(user_id: str, request: Request):
-            """Обработчик webhook от wrapper"""
+        async def handle_wrapper_webhook(user_id: str, request: Request) -> dict:
+            """Обработчик webhook от wrapper."""
             try:
                 payload = await request.json()
                 
@@ -30,9 +33,15 @@ class WebhookHandler:
                 if not task_id:
                     raise HTTPException(status_code=400, detail="Missing task_id")
                 
-                # Обновляем задачу в менеджере
-                if task_id in task_manager.user_tasks:
-                    task = task_manager.user_tasks[task_id]
+                # Получаем сервисы через контейнер
+                container = ServiceContainer.get_instance()
+                if container.task_manager is None:
+                    print("❌ Task manager not available")
+                    return {"status": "error", "message": "Task manager not available"}
+                
+                # Обновляем задачу
+                if task_id in container.task_manager.user_tasks:
+                    task = container.task_manager.user_tasks[task_id]
                     task.status = status
                     task.result = result
                     task.error = error
@@ -40,16 +49,21 @@ class WebhookHandler:
                     
                     # Отправляем уведомление пользователю
                     message_text = format_task_result(task_id, payload)
-                    await self.bot.send_message(task.chat_id, message_text)
-                    
-                    print(f"✅ Webhook processed for task {task_id}")
+                    if container.bot:
+                        await container.bot.send_message(task.chat_id, message_text)
+                        print(f"✅ Webhook processed for task {task_id}")
+                    else:
+                        print("❌ Bot not available for sending message")
+                else:
+                    print(f"⚠️ Task {task_id} not found in user tasks")
                 
                 return {"status": "ok"}
                 
-            except Exception as e:
-                print(f"❌ Webhook error: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
+            except Exception as error:
+                print(f"❌ Webhook error: {error}")
+                raise HTTPException(status_code=500, detail=str(error))
 
     @property
-    def application(self):
+    def application(self) -> FastAPI:
+        """Получить FastAPI приложение."""
         return self.app

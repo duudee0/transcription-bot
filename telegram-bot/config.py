@@ -1,3 +1,4 @@
+from enum import Enum
 import os
 from typing import Dict, List, Optional
 
@@ -82,6 +83,16 @@ class Config:
     def callback_url(self):
         """URL для callback от wrapper к боту - КАК В ВАШЕМ КОДЕ"""
         return f"http://{self.BOT_CALLBACK_HOST_DOCKER}:{self.BOT_PORT}/client/webhook"
-
+    
+# Команды для клавиатуры
+class TextCommands(str, Enum):
+    ANALYZE_TEXT = "📝 Анализ текста"
+    TRANSCRIBATION = "🎤 Транскрибация"
+    TEXT_TO_SPEECH = "🔊 Текст в речь"
+    VOICE_CHAT = "💬 Голосовой чат"
+    CUSTOM_CHAIN = "⚙️ Кастомная цепочка"
+    MY_TASK = "📊 Мои задачи"
+    HELP = "ℹ️ Помощь"
+    CANCEL = "❌ Отмена"
 
 config = Config()

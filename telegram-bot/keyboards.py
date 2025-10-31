@@ -1,9 +1,10 @@
+from enum import Enum
 from typing import List
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton, 
     InlineKeyboardMarkup, InlineKeyboardButton
 )
-from config import config
+from config import config, TextCommands
 
 
 def get_main_keyboard():
@@ -11,19 +12,19 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [
-                KeyboardButton(text="📝 Анализ текста"),
-                KeyboardButton(text="🎤 Транскрибация"),
+                KeyboardButton(text=TextCommands.ANALYZE_TEXT),
+                KeyboardButton(text=TextCommands.TRANSCRIBATION),
             ],
             [
-                KeyboardButton(text="🔊 Текст в речь"), 
-                KeyboardButton(text="💬 Голосовой чат"),
+                KeyboardButton(text=TextCommands.TEXT_TO_SPEECH), 
+                KeyboardButton(text=TextCommands.VOICE_CHAT),
             ],
             [
-                KeyboardButton(text="⚙️ Кастомная цепочка"),
-                KeyboardButton(text="📊 Мои задачи"),
+                KeyboardButton(text=TextCommands.CUSTOM_CHAIN),
+                KeyboardButton(text=TextCommands.MY_TASK),
             ],
             [
-                KeyboardButton(text="ℹ️ Помощь"),
+                KeyboardButton(text=TextCommands.HELP),
             ]
         ],
         resize_keyboard=True,
@@ -82,7 +83,7 @@ def get_service_chain_keyboard(selected_services: List[str] = None):
         )
     else:
         control_buttons.append(
-            InlineKeyboardButton(text="❌ Отмена", callback_data="chain_cancel")
+            InlineKeyboardButton(text=TextCommands.CANCEL, callback_data="chain_cancel")
         )
     
     buttons.append(control_buttons)
@@ -93,6 +94,6 @@ def get_service_chain_keyboard(selected_services: List[str] = None):
 def get_cancel_keyboard():
     """Клавиатура отмены."""
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="❌ Отмена")]],
+        keyboard=[[KeyboardButton(text=TextCommands.CANCEL)]],
         resize_keyboard=True
     )
