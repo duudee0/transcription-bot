@@ -1,3 +1,6 @@
+"""
+ Wrapper заниматься внешней API для сторонних фронтендов
+"""
 import os
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
@@ -207,6 +210,7 @@ async def create_task(task_request: TaskRequest, background_tasks: BackgroundTas
         )
 
     # sync path: schedule background waiter and return processing response
+    logger.info(f"🔅 timeout: {task_request.timeout}")
     background_tasks.add_task(wait_for_task_completion, task_id, task_request.timeout)
     return TaskResponse(
         task_id=task_id,
@@ -223,7 +227,7 @@ async def get_task_status(task_id: str):
     if task_id not in task_store:
         raise HTTPException(status_code=404, detail="Task not found")
     
-    #TODO РЕАЛИЗОВАТЬ КЭШ ПАМЯТЬ С ОПРОСОМ RABBITMQ (?WORKER)
+    #TODO РЕАЛИЗОВАТЬ КЭШ ПАМЯТЬ С ОПРОСОМ RABBITMQ (?WORKER) ПОКА ЧТО НЕ
     task = task_store[task_id]
     return StatusResponse(
         task_id=task_id,
