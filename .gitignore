@@ -26,3 +26,4 @@ services/*/cache/
 services/*/audio_outputs/
 tts_cache
 audio_files
+hf_cache

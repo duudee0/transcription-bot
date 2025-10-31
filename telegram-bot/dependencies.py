@@ -1,6 +1,11 @@
 """Dependency Injection контейнер для сервисов."""
+from typing import Optional
 from aiogram import Bot
-from services import TaskManager, WrapperService
+
+from services.wrapper import WrapperService
+from services.task_manager import TaskManager
+
+from file_sender import FileSender 
 
 
 class ServiceContainer:
@@ -10,8 +15,9 @@ class ServiceContainer:
     
     def __init__(self, bot: Bot = None):
         self.bot = bot
-        self._wrapper_service = None
-        self._task_manager = None
+        self._wrapper_service: Optional[WrapperService] = None
+        self._task_manager   : Optional[TaskManager]= None
+        self._file_sender    : Optional[FileSender] = None
     
     @property
     def wrapper_service(self) -> WrapperService:
@@ -26,6 +32,13 @@ class ServiceContainer:
         if self._task_manager is None and self.bot:
             self._task_manager = TaskManager(self.bot)
         return self._task_manager
+    
+    @property
+    def file_sender(self) -> FileSender:
+        """Ленивая инициализация FileSender."""
+        if self._file_sender is None and self.bot:
+            self._file_sender = FileSender(self.bot)
+        return self._file_sender
     
     @classmethod
     def get_instance(cls) -> 'ServiceContainer':
@@ -44,3 +57,13 @@ def get_task_manager() -> TaskManager:
         raise RuntimeError("TaskManager not initialized. Bot might not be set.")
     
     return task_manager
+
+def get_file_sender() -> FileSender:
+    """Получить FileSender из контейнера."""
+    container = ServiceContainer.get_instance()
+    file_sender = container.file_sender
+    
+    if file_sender is None:
+        raise RuntimeError("FileSender not initialized. Bot might not be set.")
+    
+    return file_sender

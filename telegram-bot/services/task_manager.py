@@ -9,55 +9,7 @@ from aiogram import Bot
 
 from config import config
 from models import UserTask, TaskStatus
-
-
-class WrapperService:
-    """Сервис для работы с Wrapper API."""
-    
-    def __init__(self):
-        self.base_url = config.WRAPPER_URL
-        self.client = httpx.AsyncClient(timeout=30.0)
-    
-    async def create_task(
-        self,
-        task_type: str,
-        input_data: Dict[str, Any],
-        service_chain: List[str],
-        parameters: Optional[Dict[str, Any]] = None,
-        callback_url: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """Создает задачу в wrapper."""
-        payload = {
-            "task_type": task_type,
-            "input_data": input_data,
-            "service_chain": service_chain,
-            "parameters": parameters or {},
-            "timeout": config.DEFAULT_TIMEOUT
-        }
-        
-        if callback_url:
-            payload["callback_url"] = callback_url
-            
-        response = await self.client.post(
-            f"{self.base_url}/api/v1/tasks",
-            json=payload
-        )
-        response.raise_for_status()
-        
-        return response.json()
-    
-    async def get_task_status(self, task_id: str) -> Dict[str, Any]:
-        """Получает статус задачи."""
-        response = await self.client.get(
-            f"{self.base_url}/api/v1/tasks/{task_id}"
-        )
-        response.raise_for_status()
-        return response.json()
-    
-    async def close(self):
-        """Закрывает HTTP клиент."""
-        await self.client.aclose()
-
+from services.wrapper import WrapperService
 
 class TaskManager:
     """Менеджер задач пользователей."""
@@ -187,6 +139,7 @@ class TaskManager:
             return
             
         task = self.user_tasks[task_id]
+        # TODO: ПОФИКСИТЬ ТИПЫ НОРМАЛЬНЫЕ
         task.status = TaskStatus(status_data.get("status"))
         task.result = status_data.get("result")
         task.error = status_data.get("error")
@@ -202,13 +155,24 @@ class TaskManager:
             )
     
     async def _send_task_result(self, chat_id: int, task_id: str, status_data: Dict[str, Any]):
-        """Отправляет результат пользователю."""
-        from utils import format_task_result
-        
+        """Отправляет результат пользователю через FileSender."""
         try:
-            message = format_task_result(task_id, status_data)
-            await self.bot.send_message(chat_id, message)
-            print(f"✳️ Sent result to user for task {task_id}")
+            from file_sender import FileSender  # Локальный импорт
+
+            status = status_data.get("status", "unknown")
+            result = status_data.get("result")
+            error = status_data.get("error")
+            
+            file_sender = FileSender(self.bot)  # Создаем инстанс когда нужно
+
+            await file_sender.send_task_result(
+                chat_id=chat_id,
+                task_id=task_id,
+                status=status,
+                result=result,
+                error=error
+            )
+            print(f"📨 Sent result to user for task {task_id}")
         except Exception as error:
             print(f"❌ Error sending result: {error}")
     

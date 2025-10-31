@@ -1,7 +1,7 @@
 import json
 from typing import Dict, Any, Tuple
 from config import config
-
+from models import UserTask
 
 def validate_json(text: str) -> Tuple[bool, Any]:
     """Проверяет валидность JSON."""
@@ -17,7 +17,7 @@ def validate_text_length(text: str, max_length: int = 4000) -> bool:
     return len(text) <= max_length
 
 
-def format_task_status(task) -> str:
+def format_task_status(task: UserTask) -> str:
     """Форматирует статус задачи для пользователя."""
     status_icons = {
         "pending": "⏳",
@@ -35,7 +35,8 @@ def format_task_status(task) -> str:
         f"{icon} <b>Задача #{task.task_id[:8]}</b>\n"
         f"📊 Тип: {task.task_type}\n"
         f"🔗 Цепочка: {service_chain}\n" 
-        f"📈 Статус: {task.status}\n"
+        # TODO: ПОФИКСИТЬ ТИПЫ НОРМАЛЬНЫЕ
+        f"📈 Статус: {task.status if isinstance(task.status, str) else task.status.value}\n"
         f"🕐 Создана: {task.created_at.strftime('%H:%M:%S')}\n"
     )
 

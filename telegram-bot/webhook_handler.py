@@ -23,7 +23,7 @@ class WebhookHandler:
             try:
                 payload = await request.json()
                 
-                print(f"📨 Webhook received for user {user_id}: {payload}")
+                print(f"📨 Webhook received for user {user_id}: {payload.get('status')}")
                 
                 task_id = payload.get("task_id")
                 status = payload.get("status")
@@ -47,13 +47,22 @@ class WebhookHandler:
                     task.error = error
                     task.updated_at = datetime.now()
                     
-                    # Отправляем уведомление пользователю
-                    message_text = format_task_result(task_id, payload)
-                    if container.bot:
-                        await container.bot.send_message(task.chat_id, message_text)
+                    # Отправляем результат пользователю через FileSender
+                    try:
+                        from file_sender import FileSender
+
+                        file_sender = FileSender(container.bot)  # Создаем напрямую
+        
+                        await file_sender.send_task_result(
+                            chat_id=task.chat_id,
+                            task_id=task_id,
+                            status=status,
+                            result=result,
+                            error=error
+                        )
                         print(f"✅ Webhook processed for task {task_id}")
-                    else:
-                        print("❌ Bot not available for sending message")
+                    except Exception as e:
+                        print(f"❌ Error sending result for task {task_id}: {e}")
                 else:
                     print(f"⚠️ Task {task_id} not found in user tasks")
                 
