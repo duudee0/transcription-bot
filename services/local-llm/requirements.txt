@@ -1,6 +1,0 @@
-pydantic
-fastapi
-uvicorn
-httpx
-aio_pika
-requests

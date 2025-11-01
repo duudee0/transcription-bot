@@ -1,5 +1,0 @@
-httpx
-aio_pika
-pydantic
-fastapi
-uvicorn
