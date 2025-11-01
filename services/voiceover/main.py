@@ -1,5 +1,6 @@
 # xtts_silero_pkg_service.py
 import os
+import re
 import uuid
 import asyncio
 import functools
@@ -14,7 +15,13 @@ from fastapi.staticfiles import StaticFiles
 # Требуемый официальный пакет — silero-tts
 # Точная точка импорта может зависеть от версии пакета; этот импорт работает для распространённых релизов.
 # Если у вас другой пакет-нейм, замените на корректный (но пакет silero-tts должен быть установлен).
-from silero_tts.silero_tts import SileroTTS
+try:
+    from silero_tts import SileroTTS
+except ImportError:
+    try:
+        from silero_tts.silero_tts import SileroTTS
+    except ImportError:
+        raise ImportError("Cannot import SileroTTS from 'silero-tts' package")
 
 
 # Ваши общие модули (не менять)
@@ -82,14 +89,45 @@ class SileroService(BaseService):
         if "text" not in task_message.data.payload:
             raise HTTPException(status_code=400, detail="'text' is required in payload")
 
+    def _detect_language_simple(self, text: str) -> str:
+            """
+            Простое определение языка на основе статистики символов.
+            Считаем кириллические и латинские символы.
+            """
+            # Очищаем текст от лишних символов, оставляем только буквы
+            clean_text = re.sub(r'[^a-zA-Zа-яА-ЯёЁ]', '', text)
+            
+            if not clean_text:
+                return DEFAULT_LANGUAGE  # fallback
+                
+            # Считаем кириллические и латинские символы
+            cyrillic_count = len(re.findall(r'[а-яА-ЯёЁ]', clean_text))
+            latin_count = len(re.findall(r'[a-zA-Z]', clean_text))
+            
+            # Определяем язык по преобладающим символам
+            if cyrillic_count > latin_count:
+                return "ru"
+            elif latin_count > cyrillic_count:
+                return "en"
+            else:
+                # Если равное количество - используем дефолтный
+                return DEFAULT_LANGUAGE
+
     async def _process_task_logic(self, task_message: TaskMessage) -> Data:
         text = task_message.data.payload.get("text")
-        language = (task_message.data.payload.get("language") or DEFAULT_LANGUAGE).lower()
-        speaker = task_message.data.payload.get("speaker")  # optional named speaker
-        speaker_audio_url = task_message.data.payload.get("speaker_audio_url")  # ignored (no cloning)
+        
+        # Определяем язык: если не указан явно - определяем автоматически
+        explicit_language = task_message.data.payload.get("language")
+        if explicit_language:
+            language = explicit_language.lower()
+        else:
+            language = self._detect_language_simple(text)
+            print(f"🔍 Auto-detected language: {language} for text: {text[:50]}...")
+        
+        speaker = task_message.data.payload.get("speaker")
+        speaker_audio_url = task_message.data.payload.get("speaker_audio_url")
 
         if speaker_audio_url:
-            # честно: silero-tts wrapper не делает one-shot cloning — логируем
             print("⚠️ speaker_audio_url provided but voice cloning is not supported; ignoring.")
 
         audio_url = await self._generate_audio(text=text, language=language, speaker=speaker)
@@ -101,6 +139,7 @@ class SileroService(BaseService):
                 "original_text": text,
                 "model_used": "silero-tts (pip)",
                 "language": language,
+                "language_auto_detected": explicit_language is None,  # показываем, был ли язык определен автоматически
             },
             execution_metadata={"task_type": "text_to_speech", "service": self.service_name},
         )
@@ -157,61 +196,78 @@ class SileroService(BaseService):
         self._tts_objects[lang] = tts
         print(f"✅ silero-tts instance created for lang={lang}, model_id={kwargs['model_id']}, speaker={chosen_speaker}, sr={sample_rate}")
         return tts
+    
+    # ---------------------------
+    # Internal: TTS method helpers
+    # ---------------------------
+    def _try_tts_call(self, tts_obj: SileroTTS, method_name: str, text: str, out_path: str) -> bool:
+        """Пытается вызвать конкретный метод TTS с разными сигнатурами"""
+        method = getattr(tts_obj, method_name, None)
+        if not callable(method):
+            return False
+        
+        # Пробуем разные сигнатуры вызова
+        signatures = [
+            lambda: method(text, out_path),
+            lambda: method(text=text, file=out_path),
+            lambda: method(text=text, out_path=out_path)
+        ]
+        
+        for signature in signatures:
+            try:
+                signature()
+                return True
+            except TypeError:
+                continue
+            except Exception:
+                return False
+        
+        return False
+
+    def _find_working_tts_method(self, tts_obj: SileroTTS, text: str, out_path: str) -> bool:
+        """Находит рабочий метод TTS среди возможных вариантов"""
+        method_names = ["tts", "synthesize", "synth", "save", "speak"]
+        return any(self._try_tts_call(tts_obj, method_name, text, out_path) 
+                for method_name in method_names)
+
+    def _execute_tts_sync(self, tts_obj: SileroTTS, text: str, out_path: str) -> None:
+        """Синхронное выполнение TTS в executor"""
+        if not self._find_working_tts_method(tts_obj, text, out_path):
+            raise RuntimeError(
+                "Unable to call SileroTTS.tts with current package version. "
+                "Check silero-tts API."
+            )
+
     # ---------------------------
     # Internal: generate audio (uses SileroTTS.tts synchronously inside executor)
     # ---------------------------
     async def _generate_audio(self, text: str, language: str, speaker: Optional[str] = None) -> str:
-        # create or reuse silero object
+        """Генерация аудио с использованием SileroTTS"""
+        # Create or reuse silero object
         tts_obj = self._get_or_create_tts(language, speaker)
 
-        # output file
+        # Generate output file path
         out_filename = f"tts_{uuid.uuid4().hex}.wav"
         out_path = str(self.output_dir / out_filename)
 
-        # The SileroTTS API commonly provides a method `tts(text, out_path)` or similar.
-        # We'll call `.tts()` inside a thread to avoid blocking event loop.
-
-        def _sync_tts_call():
-            # try common method names / signatures for widest compatibility
-            # 1) preferred: tts_obj.tts(text, out_path)
-            try:
-                tts_obj.tts(text, out_path)
-                return
-            except TypeError:
-                pass
-            except Exception as e:
-                # for unexpected errors, re-raise to be caught below
-                raise
-
-            # 2) alternative signature: tts(text=text, file=out_path) or save
-            try:
-                tts_obj.tts(text=text, file=out_path)
-                return
-            except Exception:
-                pass
-
-            # 3) some wrappers provide save() or synthesize()
-            for alt in ("synthesize", "synth", "save", "speak"):
-                fn = getattr(tts_obj, alt, None)
-                if callable(fn):
-                    try:
-                        # try common signatures
-                        try:
-                            fn(text, out_path)
-                        except TypeError:
-                            fn(text=text, out_path=out_path)
-                        return
-                    except Exception:
-                        continue
-
-            # if we get here — no known callable worked
-            raise RuntimeError("Unable to call SileroTTS.tts with current package version. Check silero-tts API.")
-
+        # Execute TTS in thread pool to avoid blocking event loop
         loop = asyncio.get_event_loop()
         try:
-            await loop.run_in_executor(None, functools.partial(_sync_tts_call))
+            await loop.run_in_executor(
+                None, 
+                self._execute_tts_sync, 
+                tts_obj, text, out_path
+            )
+        except RuntimeError as e:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"silero-tts synthesis failed: {e}"
+            )
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"silero-tts synthesis failed: {e}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Unexpected error during TTS synthesis: {e}"
+            )
 
         public_url = f"{self.service_base_url.rstrip('/')}/audio/{out_filename}"
         return public_url
@@ -243,24 +299,17 @@ class SileroService(BaseService):
             await _client.aclose()
         except Exception:
             pass
+        # Очищаем TTS объекты
+        self._tts_objects.clear()
 
-    def __del__(self):
+    def shutdown(self):
+        """Синхронное закрытие для использования в обработчиках сигналов"""
         try:
             loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = None
-        if loop and loop.is_running():
-            try:
-                asyncio.create_task(_client.aclose())
-            except Exception:
-                pass
-        else:
-            try:
-                new_loop = asyncio.new_event_loop()
-                new_loop.run_until_complete(_client.aclose())
-                new_loop.close()
-            except Exception:
-                pass
+            if loop.is_running():
+                loop.create_task(self.close())
+        except Exception:
+            pass
 
 
 # создаём сервис (как в вашей структуре)
@@ -270,8 +319,16 @@ if __name__ == "__main__":
     try:
         service.run()
     except KeyboardInterrupt:
+        print("Received interrupt signal, shutting down...")
+    finally:
+        # Явное закрытие ресурсов
         try:
-            asyncio.run(service.close())
-        except Exception:
-            pass
-        raise
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Если цикл работает, планируем закрытие
+                close_task = loop.create_task(service.close())
+                loop.run_until_complete(close_task)
+            else:
+                asyncio.run(service.close())
+        except Exception as e:
+            print(f"Error during shutdown: {e}")
