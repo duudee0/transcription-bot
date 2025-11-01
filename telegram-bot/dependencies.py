@@ -5,7 +5,7 @@ from aiogram import Bot
 from services.wrapper import WrapperService
 from services.task_manager import TaskManager
 
-from file_sender import FileSender 
+from services.file_sender import FileSender 
 
 
 class ServiceContainer:

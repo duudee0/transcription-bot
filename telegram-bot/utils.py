@@ -35,8 +35,7 @@ def format_task_status(task: UserTask) -> str:
         f"{icon} <b>Задача #{task.task_id[:8]}</b>\n"
         f"📊 Тип: {task.task_type}\n"
         f"🔗 Цепочка: {service_chain}\n" 
-        # TODO: ПОФИКСИТЬ ТИПЫ НОРМАЛЬНЫЕ
-        f"📈 Статус: {task.status if isinstance(task.status, str) else task.status.value}\n"
+        f"📈 Статус: {task.status.value}\n"
         f"🕐 Создана: {task.created_at.strftime('%H:%M:%S')}\n"
     )
 

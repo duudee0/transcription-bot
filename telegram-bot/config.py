@@ -20,6 +20,11 @@ class Config:
     # Task settings
     DEFAULT_TIMEOUT = int(os.getenv("DEFAULT_TIMEOUT", 600))
     
+    # Настройки логирования
+    LOG_LEVEL: str = "INFO"
+    LOG_FILE: Optional[str] = "logs/app.log"
+    LOG_FORMAT: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
     # Available services for user selection
     LLM_SERVICES = {
         "local-llm": "🚀 Локальная модель (llama2:7b)",

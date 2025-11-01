@@ -1,6 +1,5 @@
 """Главный модуль приложения."""
 import asyncio
-import logging
 from contextlib import asynccontextmanager
 
 from aiogram import Bot, Dispatcher
@@ -15,6 +14,10 @@ from handlers import router
 from dependencies import ServiceContainer
 from webhook_handler import WebhookHandler
 
+from logger import get_logger, setup_logger
+
+# Инициализируем логгер
+logger = get_logger(__name__)
 
 @asynccontextmanager
 async def app_lifespan():
@@ -29,7 +32,7 @@ async def app_lifespan():
     container = ServiceContainer.get_instance()
     container.bot = bot
     
-    logging.info("Application initialized")
+    logger.info("Application initialized", extra={"component": "main"})
     
     try:
         yield {
@@ -41,7 +44,7 @@ async def app_lifespan():
         await bot.session.close()
         if container.task_manager:
             await container.task_manager.close()
-        logging.info("Application shutdown complete")
+        logger.info("Application shutdown complete", extra={"component": "main"})
 
 
 async def start_web_server(webhook_handler: WebhookHandler) -> None:
@@ -58,9 +61,12 @@ async def start_web_server(webhook_handler: WebhookHandler) -> None:
 
 async def main() -> None:
     """Основная функция приложения."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    # Настройка логирования
+    setup_logger(
+        name="app",
+        log_level=config.LOG_LEVEL,
+        log_file=config.LOG_FILE,
+        format_string=config.LOG_FORMAT
     )
     
     async with app_lifespan() as app_context:
@@ -74,7 +80,13 @@ async def main() -> None:
         webhook_handler = WebhookHandler()
         
         # Запуск сервисов
-        logging.info("Starting application services...")
+        logger.info(
+            "Starting application", 
+            extra={
+                "log_level": config.LOG_LEVEL,
+                "log_file": config.LOG_FILE
+            }
+        )
         await asyncio.gather(
             dp.start_polling(bot),
             start_web_server(webhook_handler),

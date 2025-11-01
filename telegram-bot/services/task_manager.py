@@ -1,4 +1,5 @@
 """Сервисы приложения."""
+import logging
 import time
 import asyncio
 from datetime import datetime
@@ -10,6 +11,11 @@ from aiogram import Bot
 from config import config
 from models import UserTask, TaskStatus
 from services.wrapper import WrapperService
+from logger import get_logger
+
+# Инициализируем логгер для модуля
+logger = get_logger(__name__)
+
 
 class TaskManager:
     """Менеджер задач пользователей."""
@@ -42,7 +48,7 @@ class TaskManager:
                 callback_url=callback_url
             )
         except Exception as error:
-            print(f"Ошибка создания задачи: {error}")
+            logger.error(f"Ошибка создания задачи: {error}")
             raise
         
         return self._create_user_task(
@@ -111,7 +117,7 @@ class TaskManager:
         is_completed = task.status in [TaskStatus.COMPLETED, TaskStatus.ERROR]
         
         if is_completed:
-            print(f"✅ Task {task_id} completed via webhook")
+            logger.info(f"✅ Task {task_id} completed via webhook")
         
         return is_completed
     
@@ -121,7 +127,7 @@ class TaskManager:
             status_data = await self.wrapper.get_task_status(task_id)
             status = status_data.get("status")
             
-            print(f"🔍 Polling {task_id}: {status}")
+            logging.info(f"🔍 Polling {task_id}: {status}")
             
             if status in ["completed", "error", "timeout"]:
                 self._update_task_from_status(task_id, status_data)
@@ -129,7 +135,7 @@ class TaskManager:
                 return True
                 
         except Exception as error:
-            print(f"⚠️ Polling error for {task_id}: {error}")
+            logger.error(f"⚠️ Polling error for {task_id}: {error}")
         
         return False
     
@@ -139,7 +145,6 @@ class TaskManager:
             return
             
         task = self.user_tasks[task_id]
-        # TODO: ПОФИКСИТЬ ТИПЫ НОРМАЛЬНЫЕ
         task.status = TaskStatus(status_data.get("status"))
         task.result = status_data.get("result")
         task.error = status_data.get("error")
@@ -172,9 +177,9 @@ class TaskManager:
                 result=result,
                 error=error
             )
-            print(f"📨 Sent result to user for task {task_id}")
+            logger.info(f"📨 Sent result to user for task {task_id}")
         except Exception as error:
-            print(f"❌ Error sending result: {error}")
+            logger.error(f"❌ Error sending result: {error}")
     
     def get_user_tasks(self, user_id: int) -> List[UserTask]:
         """Возвращает задачи пользователя."""

@@ -11,7 +11,10 @@ from aiogram.enums import ParseMode
 from html import escape
 
 from config import config
+from logger import get_logger
 
+# Инициализируем логгер для модуля
+logger = get_logger(__name__)
 
 class FileSender:
     """Сервис для отправки файлов и результатов пользователям."""
@@ -47,7 +50,7 @@ class FileSender:
             await self._send_beautiful_result(chat_id, task_id, status, result, error)
             
         except Exception as e:
-            print(f"❌ Unexpected error while sending result to chat {chat_id}: {e}")
+            logger.error(f"❌ Unexpected error while sending result to chat {chat_id}: {e}")
             # Fallback: простая текстовая отправка при ошибке
             await self._send_fallback_result(chat_id, task_id, status, result, error)
     
@@ -89,7 +92,7 @@ class FileSender:
                 
         except Exception as e:
             # Если загрузка/отправка не удалась
-            print(f"⚠️ Failed to download/send audio from {audio_url}: {e}")
+            logger.error(f"⚠️ Failed to download/send audio from {audio_url}: {e}")
             error_msg = self._format_download_error(task_id, audio_url, e)
             await self.bot.send_message(chat_id, error_msg)
             return False
@@ -139,7 +142,7 @@ class FileSender:
                 disable_web_page_preview=True
             )
         except Exception as e:
-            print(f"❌ Error sending beautiful result: {e}")
+            logger.error(f"❌ Error sending beautiful result: {e}")
             await self._send_fallback_result(chat_id, task_id, status, result, error)
     
     def _format_beautiful_message(self, task_id: str, status: str, result: Any, error: Any) -> str:
@@ -284,7 +287,7 @@ class FileSender:
             if file_path and os.path.exists(file_path):
                 os.remove(file_path)
         except Exception as e:
-            print(f"⚠️ Failed to cleanup temp file {file_path}: {e}")
+            logger.warning(f"⚠️ Failed to cleanup temp file {file_path}: {e}")
     
     async def _send_fallback_result(
         self, 
@@ -309,7 +312,7 @@ class FileSender:
             
             await self.bot.send_message(chat_id, message)
         except Exception as e:
-            print(f"❌ Even fallback failed: {e}")
+            logger.error(f"❌ Even fallback failed: {e}")
     
     def _safe_truncate(self, text: str, limit: int = 3500) -> str:
         """Безопасно обрезает текст до лимита."""

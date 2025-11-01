@@ -16,7 +16,10 @@ from utils import (
     get_task_type_by_name, validate_json, 
     validate_text_length, format_task_status
 )
+from logger import get_logger
 
+# Инициализируем логгер для модуля
+logger = get_logger(__name__)
 
 router = Router()
 
@@ -334,7 +337,7 @@ async def handle_voice_input(message: Message, state: FSMContext) -> None:
     # Получаем сервисы через контейнер
     container = ServiceContainer.get_instance()
     if container.task_manager is None:
-        print("❌ Task manager not available") 
+        logger.error("❌ Task manager not available") 
            
     file = await container.bot.get_file(file_id)
     file_path = file.file_path

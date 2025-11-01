@@ -5,7 +5,11 @@ from datetime import datetime
 from config import config
 from dependencies import ServiceContainer
 from utils import format_task_result
+from models import TaskStatus
+from logger import get_logger
 
+# Инициализируем логгер для модуля
+logger = get_logger(__name__)
 
 class WebhookHandler:
     """Обработчик вебхуков от Wrapper API."""
@@ -23,7 +27,7 @@ class WebhookHandler:
             try:
                 payload = await request.json()
                 
-                print(f"📨 Webhook received for user {user_id}: {payload.get('status')}")
+                logger.info(f"📨 Webhook received for user {user_id}: {payload.get('status')}")
                 
                 task_id = payload.get("task_id")
                 status = payload.get("status")
@@ -36,20 +40,20 @@ class WebhookHandler:
                 # Получаем сервисы через контейнер
                 container = ServiceContainer.get_instance()
                 if container.task_manager is None:
-                    print("❌ Task manager not available")
+                    logger.error("❌ Task manager not available")
                     return {"status": "error", "message": "Task manager not available"}
                 
                 # Обновляем задачу
                 if task_id in container.task_manager.user_tasks:
                     task = container.task_manager.user_tasks[task_id]
-                    task.status = status
+                    task.status = TaskStatus(status)
                     task.result = result
                     task.error = error
                     task.updated_at = datetime.now()
                     
                     # Отправляем результат пользователю через FileSender
                     try:
-                        from file_sender import FileSender
+                        from services.file_sender import FileSender
 
                         file_sender = FileSender(container.bot)  # Создаем напрямую
         
@@ -60,16 +64,16 @@ class WebhookHandler:
                             result=result,
                             error=error
                         )
-                        print(f"✅ Webhook processed for task {task_id}")
+                        logger.info(f"✅ Webhook processed for task {task_id}")
                     except Exception as e:
-                        print(f"❌ Error sending result for task {task_id}: {e}")
+                        logger.error(f"❌ Error sending result for task {task_id}: {e}")
                 else:
-                    print(f"⚠️ Task {task_id} not found in user tasks")
+                    logger.warning(f"⚠️ Task {task_id} not found in user tasks")
                 
                 return {"status": "ok"}
                 
             except Exception as error:
-                print(f"❌ Webhook error: {error}")
+                logger.error(f"❌ Webhook error: {error}")
                 raise HTTPException(status_code=500, detail=str(error))
 
     @property
