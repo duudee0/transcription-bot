@@ -161,7 +161,28 @@ async def handle_llm_selection(callback: CallbackQuery, state: FSMContext) -> No
     """Обработчик выбора LLM сервиса."""
     service_id = callback.data.split(":")[1]
     service_name = config.LLM_SERVICES[service_id]
-    
+
+    # Если мы в цепочки чтобы сменить в ней LLM
+    user_data = await state.get_data()
+    task_type = user_data["task_type"]
+    service_chain = None
+
+    if "service_chain" in user_data:
+        service_chain = [user_data["service_chain"]]
+
+    elif len(config.SERVICE_CHAINS.get(task_type, [])) > 1:
+        service_chain = config.SERVICE_CHAINS.get(task_type, [])
+
+    if service_chain:
+        i = 0
+        # Выбираем llm если он есть в цепочки на тот что выбрали в inlaine
+        for service in service_chain:
+            for llm_service in config.LLM_SERVICES:
+                if service == llm_service:
+                    service_chain[i] = service_id
+                    await state.update_data(service_chain=service_chain)
+            i+=1
+
     await state.update_data(selected_service=service_id)
     await state.set_state(TaskCreationState.waiting_for_input)
     
@@ -247,7 +268,7 @@ async def handle_text_input(message: Message, state: FSMContext) -> None:
     if task_config.get("is_chain"):
         service_chain = config.SERVICE_CHAINS.get(task_type, [])
     elif "service_chain" in user_data:
-        service_chain = user_data["service_chain"]
+        service_chain = [user_data["service_chain"]]
     else:
         service_chain = [user_data["selected_service"]]
     
