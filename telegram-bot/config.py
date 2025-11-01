@@ -22,9 +22,9 @@ class Config:
     
     # Available services for user selection
     LLM_SERVICES = {
-        "local-llm": "🚀 Локальная модель (быстрая)",
-        "gigachat-service": "🧠 GigaChat (умная)",
-        "qwen": "🔮 Qwen (универсальная)",
+        "local-llm": "🚀 Локальная модель (llama2:7b)",
+        "gigachat-service": "🧠 GigaChat (оф api)",
+        "qwen": "🔮 Qwen (Open Router)",
     }
     
     AUDIO_SERVICES = {
