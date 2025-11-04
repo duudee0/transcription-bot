@@ -98,6 +98,22 @@ services:
     networks:
       - internal
 
+  yandex-gpt:
+    build:
+      context: ./
+      dockerfile: services/yandex-gpt/Dockerfile
+    environment:
+      - PORT=8000
+      - YANDEX_OAUTH_TOKEN=${YANDEX_OAUTH_TOKEN}
+      - YANDEX_FOLDER_ID=${YANDEX_FOLDER_ID}
+      - YANDEX_TEMPERATURE=0.7
+      - YANDEX_MAX_TOKENS=1000
+    ports:
+      - "8011:8000"   # Different port to avoid conflict
+    command: sh -c "sleep 7 && exec python main.py"
+    networks:
+      - internal
+
   ollama:
     image: ollama/ollama:latest
     ports:

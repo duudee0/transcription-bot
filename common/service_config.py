@@ -14,7 +14,8 @@ SERVICE_REGISTRY: Dict[str, str] = {
     "whisper": "http://whisper:8000", # Транскрибация
     "transcribe_audio": "http://whisper:8000", 
     "qwen": "http://qwen:8000", # еще одна LLM
-    "voiceover" :"http://voiceover:8000" # Озвучка
+    "voiceover" :"http://voiceover:8000", # Озвучка
+    "yandex-gpt": "http://yandex-gpt:8000" # Яндекс гпт
 }
 
 MULTI_SERVICE_CHAINS = {
