@@ -114,6 +114,30 @@ services:
     networks:
       - internal
 
+  summarization:
+    build: 
+      context: ./
+      dockerfile: services/summarization/Dockerfile
+    ports:
+      - "8012:8000"
+    environment:
+      #- SUMMARIZATION_MODEL=facebook/bart-large-cnn
+      - SUMMARIZATION_MODEL=IlyaGusev/mbart_ru_sum_gazeta
+      - MODEL_TIMEOUT=300
+    volumes:
+      - ./models:/root/.cache/huggingface  # Кэширование модели
+      - ./services/summarization:/app
+      - ./common/models.py:/app/common/models.py:ro
+      - ./common/publisher.py:/app/common/publisher.py:ro
+      - ./services/common/base_service.py:/app/common/base_service.py:ro
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    restart: unless-stopped
+    networks:
+      - internal
+
   ollama:
     image: ollama/ollama:latest
     ports:

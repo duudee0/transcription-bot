@@ -30,7 +30,8 @@ class Config:
         "local-llm": "🚀 Локальная модель (llama2:7b)",
         "gigachat-service": "🧠 GigaChat",
         "qwen": "🔮 Qwen (Open Router)",
-        "yandex-gpt": "💤 Yandex GPT"
+        "yandex-gpt": "💤 Yandex GPT",
+        "summarization": "♻️ Суммаризация",
     }
     
     AUDIO_SERVICES = {
@@ -82,7 +83,7 @@ class Config:
             "input_type": "text",
             "needs_service_selection": True,
             "service_type": "custom"
-        }
+        },
     }
 
     @property

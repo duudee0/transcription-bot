@@ -1,0 +1,11 @@
+pydantic
+fastapi
+uvicorn
+httpx
+aio_pika
+requests
+transformers
+torch
+protobuf 
+tiktoken 
+sentencepiece
