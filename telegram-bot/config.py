@@ -39,6 +39,10 @@ class Config:
         "voiceover": "🔊 Озвучка текста",
     }
     
+    DOCUMETS_SERVICE = {
+        "qdrant-service": "📜 Векторная база"
+    }
+
     # Predefined service chains for common tasks
     SERVICE_CHAINS = {
         "voice_chat": ["whisper", "local-llm", "voiceover"],
@@ -68,6 +72,12 @@ class Config:
             "input_type": "text", 
             "needs_service_selection": False,
             "default_service": "voiceover"
+        },
+        "documet-service": {
+            "name": "📜 Векторная база",
+            "description": "Поиск по базе файлов",
+            "input_type": "text",
+            "default_service": "qdrant-service",
         },
         "voice_chat": {
             "name": "💬 Голосовой чат",

@@ -63,7 +63,7 @@ def get_service_chain_keyboard(selected_services: List[str] = None):
     buttons = []
     
     # Доступные сервисы
-    all_services = {**config.LLM_SERVICES, **config.AUDIO_SERVICES}
+    all_services = {**config.LLM_SERVICES, **config.AUDIO_SERVICES, **config.DOCUMETS_SERVICE}
     
     for service_id, service_name in all_services.items():
         prefix = "✅" if service_id in selected_services else "◻️"

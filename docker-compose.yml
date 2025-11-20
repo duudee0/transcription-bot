@@ -285,6 +285,8 @@ services:
       CLIENT_CALLBACK_URL_FOR_WRAPPER: "http://telegram-bot:9000/client/webhook"
       POLL_INTERVAL: "1.0"
       GLOBAL_TIMEOUT: "60"
+    volumes:
+      - ./telegram-bot/:/app
     ports:
       - "9000:9000"  # если вы хотите пробросить для отладки
     networks:
@@ -296,6 +298,48 @@ services:
       timeout: 5s
       retries: 5
 
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"           # HTTP API
+    volumes:
+      - ./qdrant_storage:/qdrant/storage
+    environment:
+      QDRANT_HTTP_PORT: 6333
+    networks:
+      - internal
+
+  qdrant-service:
+    build:
+      context: ./
+      dockerfile: services/qdrant-service/Dockerfile
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - QDRANT_COLLECTION=documents
+      - EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+      - EMBEDDING_BATCH_SIZE=32
+      - CHUNK_SIZE_CHARS=3000
+      - CHUNK_OVERLAP_CHARS=500
+      - DOWNLOAD_TIMEOUT=60
+    ports:
+      - "8014:8000"   # Новый порт для whisper service
+    networks:
+      - internal
+    volumes:
+      - ./services/qdrant-service:/app
+      - ./common/models.py:/app/common/models.py:ro
+      - ./common/publisher.py:/app/common/publisher.py:ro
+      - ./services/common/base_service.py:/app/common/base_service.py:ro
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 2G
+    #     reservations:
+    #       memory: 1G
+
 networks:
   frontend:
   internal:
@@ -303,5 +347,7 @@ networks:
   voice:
 
 volumes:
+  qdrant_storage:
+    driver: local
   pgdata:
   ollama_data: {}

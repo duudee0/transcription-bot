@@ -271,10 +271,10 @@ async def handle_text_input(message: Message, state: FSMContext) -> None:
     if task_config.get("is_chain"):
         service_chain = config.SERVICE_CHAINS.get(task_type, [])
     elif "service_chain" in user_data:
-        service_chain = [user_data["service_chain"]]
+        service_chain = user_data["service_chain"]
     else:
-        service_chain = [user_data["selected_service"]]
-    
+        service_chain = user_data["selected_service"]
+
     # Создаем задачу
     try:
         user_task = await task_manager.create_task(
@@ -291,7 +291,7 @@ async def handle_text_input(message: Message, state: FSMContext) -> None:
             status_text,
             reply_markup=get_main_keyboard()
         )
-        
+    
     except Exception as error:
         await message.answer(
             f"❌ <b>Ошибка при создании задачи:</b>\n{str(error)}",
@@ -368,6 +368,66 @@ async def handle_voice_input(message: Message, state: FSMContext) -> None:
             reply_markup=get_main_keyboard()
         )
     await state.clear()
+
+#* ОБРАБОТКА ФАЙЛОВ ДЛЯ QDRANT
+@router.message(F.document)
+async def handle_pdf_document(message: Message, state: FSMContext) -> None:
+    """Обработчик присланных PDF-файлов — сразу создаёт задачу index_document для Qdrant."""
+    try:
+        task_manager = get_task_manager()
+    except RuntimeError as error:
+        await message.answer(f"❌ Сервис временно недоступен: {error}")
+        await state.clear()
+        return
+
+    # Проверяем, что есть document и имя файла
+    doc = message.document
+    if not doc or not getattr(doc, "file_name", None):
+        await message.answer("❌ Файл не распознан.")
+        return
+
+    filename = doc.file_name.lower()
+    # Обрабатываем только pdf
+    if not filename.endswith(".pdf"):
+        await message.answer("ℹ️ Поддерживаются только PDF-файлы. Отправьте .pdf для индексирования.")
+        return
+
+    await message.answer("📥 Получен PDF. Отправляю на индексирование...", reply_markup=get_main_keyboard())
+
+    # Получаем file_path от Telegram и формируем ссылку для скачивания
+    container = ServiceContainer.get_instance()
+    try:
+        file_obj = await container.bot.get_file(doc.file_id)
+        file_path = file_obj.file_path
+        file_url = f"https://api.telegram.org/file/bot{config.TELEGRAM_TOKEN}/{file_path}"
+    except Exception as e:
+        logger.exception("Ошибка при получении файла из Telegram: %s", e)
+        await message.answer("❌ Не удалось получить файл из Telegram.")
+        return
+
+    # Формируем service_chain — направляем задачу прямо в qdrant (можно править по конфигу)
+    service_chain = ["qdrant-service"]
+
+    # Создаём задачу index_document
+    try:
+        user_task = await task_manager.create_task(
+            user_id=message.from_user.id,
+            chat_id=message.chat.id,
+            task_type="index_document",
+            input_data={"file_url": file_url, "owner": str(message.from_user.id)},
+            service_chain=service_chain
+        )
+
+        status_text = format_task_status(user_task)
+        await message.answer(status_text, reply_markup=get_main_keyboard())
+
+    except Exception as error:
+        logger.exception("Ошибка при создании задачи index_document: %s", error)
+        await message.answer(f"❌ Ошибка при создании задачи: {error}", reply_markup=get_main_keyboard())
+
+    # Чистим состояние (если было)
+    await state.clear()
+
 
 
 @router.message()

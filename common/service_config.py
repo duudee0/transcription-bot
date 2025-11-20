@@ -17,6 +17,7 @@ SERVICE_REGISTRY: Dict[str, str] = {
     "voiceover" :"http://voiceover:8000", # Озвучка
     "yandex-gpt": "http://yandex-gpt:8000", # Яндекс гпт
     "summarization": "http://summarization:8000", # Суммаризация summarization
+    "qdrant-service": "http://qdrant-service:8000", # Взаимодействие с векторной бд
 }
 
 MULTI_SERVICE_CHAINS = {

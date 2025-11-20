@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pydantic
+httpx
+aiofiles
+aio_pika
+sentence-transformers
+qdrant-client
+pymupdf
+numpy
+torch
+tqdm
