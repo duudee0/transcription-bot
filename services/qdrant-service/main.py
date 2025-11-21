@@ -62,11 +62,19 @@ class QdrantService(BaseService):
         # httpx клиент (async) для скачивания и вызова внешних сервисов
         self.client = httpx.AsyncClient(timeout=DOWNLOAD_TIMEOUT)
 
+        # Хранения кеша модели
+        cache_dir = os.getenv("MODEL_CACHE_DIR", "./model_cache")
+
         # Загрузка эмбеддинговой модели (локально, blocking)
         if SentenceTransformer is None:
             raise RuntimeError("sentence-transformers is required but not installed. Install sentence-transformers.")
         print(f"🔄 Loading embedding model: {EMBEDDING_MODEL_NAME}")
-        self.embed_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        # Добавляем аргумент cache_folder
+        self.embed_model = SentenceTransformer(
+            EMBEDDING_MODEL_NAME, 
+            cache_folder=cache_dir
+        )
+        print("✅ Embedding model loaded")
         print(f"✅ Embedding model loaded: {EMBEDDING_MODEL_NAME}")
 
         # Qdrant client (sync) - оборачиваем в executor для async вызовов
@@ -144,82 +152,85 @@ class QdrantService(BaseService):
         else:
             raise HTTPException(status_code=400, detail=f"Unknown task_type: {task_type} or/and no support type payload{payload_type}")
 
-    # -------------------------
-    # Indexing flows
-    # -------------------------
-    async def _handle_index_document(self, task_message: TaskMessage) -> Data:
-        payload = task_message.data.payload
-        file_url = payload.get("file_url")
-        owner = payload.get("owner", "unknown")
-
-        # скачиваем и извлекаем текст
-        temp_path = await self._download_file(file_url)
-        try:
-            text = await self._extract_text_from_file(temp_path)
-
-        finally:
-            # удаляем файл
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-
+    # ---------------------------------------------------------
+    # Обработка
+    # ---------------------------------------------------------
+    async def _process_text_content(self, text: str, doc_id: str, owner: str, origin_url: Optional[str] = None) -> Dict[str, Any]:
+        """Общая логика для обработки текста: чанкинг -> эмбеддинг -> upsert"""
         if not text or not text.strip():
-            raise HTTPException(status_code=400, detail="No text extracted from document")
+             raise HTTPException(status_code=400, detail="Empty text content")
 
         # Чанкинг
         chunks = self._chunk_text(text, chunk_size=self.chunk_size, overlap=self.chunk_overlap)
-
-        # Создаём мета для документа
-        doc_id = payload.get("doc_id") or f"doc-{uuid.uuid4().hex}"
-        # вычисляем checksum всего текста
         checksum = hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-        # Подготовка точек для индексации
+        
         points = []
+        previews = [] # Для эмбеддинга собираем тексты отдельно
+        
         for idx, (chunk_text, start_offset) in enumerate(chunks):
-            # Сохраняем оригинальный читаемый id, но НЕ используем его как point id в Qdrant
-            original_chunk_id = f"{doc_id}::chunk::{idx}::{uuid.uuid4().hex}"
-            # Генерируем валидный для Qdrant id (UUID string)
+            # Приведение типов
+            chunk_text_str = str(chunk_text)
+            
             qdrant_point_id = str(uuid.uuid4())
-
-            # Приводим текст чанка к строке (страх от нестрок)
-            chunk_text_str = chunk_text if isinstance(chunk_text, str) else str(chunk_text)
+            original_chunk_id = f"{doc_id}::chunk::{idx}::{uuid.uuid4().hex}"
 
             payload_meta = {
                 "doc_id": doc_id,
                 "owner": owner,
                 "offset": start_offset,
                 "chunk_index": idx,
-                "origin_url": file_url,
                 "checksum": checksum,
-                "text_preview": chunk_text_str[:500],
-                "source_id": original_chunk_id  # сохраняем читабельный id
+                "text_preview": chunk_text_str[:500], # Magic number -> constant
+                "source_id": original_chunk_id
             }
+            if origin_url:
+                payload_meta["origin_url"] = origin_url
+
             points.append({"id": qdrant_point_id, "text": chunk_text_str, "payload": payload_meta})
+            previews.append(chunk_text_str)
 
-        # Получаем embeddings батчами (blocking)
-        embeddings = await self._embed_texts([p["text"] for p in points])
+        # Эмбеддинг (batch processing)
+        embeddings = await self._embed_texts(previews)
 
-        # Формируем запись для Qdrant (id уже валидны)
+        # Сборка для Qdrant
         q_points = []
         for p, emb in zip(points, embeddings):
             vec = emb.tolist() if hasattr(emb, "tolist") else list(emb)
             q_points.append({"id": p["id"], "vector": vec, "payload": p["payload"]})
 
-        # Upsert в Qdrant
-        upserted = await self._qdrant_upsert(q_points)
+        # Upsert
+        upsert_result = await self._qdrant_upsert(q_points)
+        
+        return {
+            "doc_id": doc_id,
+            "chunks_count": len(q_points),
+            "upsert_result": upsert_result
+        }
+
+    # ---------------------------------------------------------
+    # Refactored Handlers
+    # ---------------------------------------------------------
+    async def _handle_index_document(self, task_message: TaskMessage) -> Data:
+        payload = task_message.data.payload
+        file_url = payload.get("file_url")
+        owner = payload.get("owner", "unknown")
+        doc_id = payload.get("doc_id") or f"doc-{uuid.uuid4().hex}"
+
+        temp_path = await self._download_file(file_url)
+        try:
+            text = await self._extract_text_from_file(temp_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+        result = await self._process_text_content(text, doc_id, owner, origin_url=file_url)
 
         return Data(
             payload_type=PayloadType.TEXT,
             task_type="index_document",
-            payload={
-                "task": "index_document",
-                "doc_id": doc_id,
-                "chunks_indexed": len(q_points),
-                "upsert_result": upserted
-            },
+            payload={**result, "task": "index_document"},
             execution_metadata={"service": self.service_name}
         )
-
 
     async def _handle_index_text(self, task_message: TaskMessage) -> Data:
         payload = task_message.data.payload
@@ -227,104 +238,109 @@ class QdrantService(BaseService):
         owner = payload.get("owner", "unknown")
         doc_id = payload.get("doc_id") or f"doc-{uuid.uuid4().hex}"
 
-        chunks = self._chunk_text(text, chunk_size=self.chunk_size, overlap=self.chunk_overlap)
-
-        points = []
-        for idx, (chunk_text, start_offset) in enumerate(chunks):
-            original_chunk_id = f"{doc_id}::chunk::{idx}::{uuid.uuid4().hex}"
-            qdrant_point_id = str(uuid.uuid4())
-            chunk_text_str = chunk_text if isinstance(chunk_text, str) else str(chunk_text)
-
-            payload_meta = {
-                "doc_id": doc_id,
-                "owner": owner,
-                "offset": start_offset,
-                "chunk_index": idx,
-                "text_preview": chunk_text_str[:500],
-                "source_id": original_chunk_id
-            }
-            points.append({"id": qdrant_point_id, "text": chunk_text_str, "payload": payload_meta})
-
-        embeddings = await self._embed_texts([p["text"] for p in points])
-
-        q_points = []
-        for p, emb in zip(points, embeddings):
-            vec = emb.tolist() if hasattr(emb, "tolist") else list(emb)
-            q_points.append({"id": p["id"], "vector": vec, "payload": p["payload"]})
-
-        upserted = await self._qdrant_upsert(q_points)
+        result = await self._process_text_content(text, doc_id, owner)
 
         return Data(
             payload_type=PayloadType.TEXT,
             task_type="index_text",
-            payload={
-                "task": "index_text",
-                "doc_id": doc_id,
-                "chunks_indexed": len(q_points),
-                "upsert_result": upserted
-            },
+            payload={**result, "task": "index_text"},
             execution_metadata={"service": self.service_name}
         )
+
 
     # -------------------------
     # Search flow
     # -------------------------
     async def _handle_search(self, task_message: TaskMessage) -> Data:
         payload = task_message.data.payload
-        query = payload.get("text", "").strip()  # Обязательно .strip()!
+        query = payload.get("text", "").strip()
         top_k = int(payload.get("top_k", 6))
-        
-        # === КРИТИЧЕСКАЯ ПРОВЕРКА: ЗАПРЕЩАЕМ ПУСТЫЕ ЗАПРОСЫ ===
+
+        # 1. Валидация запроса
         if not query:
-            raise HTTPException(
-                status_code=400,
-                detail="Search query cannot be empty. Please provide a meaningful question."
-            )
-        
-        print(f"🔍 Processing search query: '{query}'")  # Для отладки
-        
-        # Получаем embedding для запроса
-        q_embs = await self._embed_texts([query])
-        q_emb = q_embs[0]
-        
-        # === ВАЛИДАЦИЯ ЭМБЕДДИНГА ===
+            raise HTTPException(status_code=400, detail="Search query cannot be empty.")
+
+        # 2. Эмбеддинг
+        try:
+            q_embs = await self._embed_texts([query])
+            q_emb = q_embs[0]
+        except Exception as e:
+             raise HTTPException(status_code=500, detail=f"Embedding generation failed: {str(e)}")
+
         if not self._is_valid_embedding(q_emb):
-            raise HTTPException(
-                status_code=400,
-                detail="Failed to generate meaningful embedding for the query. Try rephrasing."
-            )
-        
-        # Поиск в Qdrant с фильтрацией по минимальному скору
+             raise HTTPException(status_code=400, detail="Generated embedding is invalid (zero vector).")
+
+        # 3. Поиск в Qdrant
         search_results = await self._qdrant_search(
-            vector=q_emb, 
+            vector=q_emb,
             top=top_k,
-            score_threshold=0.3  # Минимальное сходство для релевантных результатов
+            score_threshold=0.3
         )
+
+        # 4. Формирование ответа (текст + метаданные)
+        formatted_text, sources_meta = self._format_results(search_results)
         
-        # Если нет релевантных результатов — возвращаем пустой ответ с подсказкой
-        if not search_results:
-            return Data(
-                payload_type=PayloadType.TEXT,
-                task_type="search",
-                payload={
-                    "task": "search",
-                    "query": query,
-                    "results": [],
-                    "message": "No relevant results found. Try rephrasing your question."
-                },
-                execution_metadata={"service": self.service_name}
-            )
+        # Логика ответа: даже если ничего не найдено, возвращаем Data, но с пустым текстом
+        # или сообщением, чтобы пайплайн не падал с ошибкой, а LLM знала, что контекста нет.
         
+        final_payload = {
+            "text": formatted_text if search_results else "No relevant context found.",
+            "query": query, # Возвращаем запрос для контекста
+            "found_count": len(search_results)
+        }
+
+        # Метаданные отправляем в execution_metadata, как ты просил
+        exec_meta = {
+            "service": self.service_name,
+            "model": EMBEDDING_MODEL_NAME,
+            "sources": sources_meta # Список словарей с деталями (url, doc_id, score)
+        }
+
         return Data(
             payload_type=PayloadType.TEXT,
-            task_type="search",
-            payload={
-                "task": "search",
-                "query": query,
-                "results": search_results
-            },
-            execution_metadata={"service": self.service_name}
+            task_type="search_result",
+            payload=final_payload,
+            execution_metadata=exec_meta
         )
+
+    def _format_results(self, results: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
+        """
+        Превращает сырой ответ Qdrant в красивую строку для LLM и список метаданных.
+        """
+        if not results:
+            return "", []
+
+        formatted_parts = []
+        sources_metadata = []
+
+        for i, hit in enumerate(results):
+            # Извлекаем данные из payload точки Qdrant
+            # hit имеет структуру: {'id': ..., 'score': ..., 'payload': {...}}
+            p = hit.get("payload", {})
+            text_content = p.get("text_preview", "").strip()
+            
+            # Формируем блок текста для LLM
+            # Пример: 
+            # [1] (Score: 0.85) ...текст...
+            part = f"[{i + 1}] (Relevance: {hit['score']:.2f})\n{text_content}"
+            formatted_parts.append(part)
+
+            # Собираем технические данные (источники)
+            meta = {
+                "index": i + 1,
+                "score": round(hit["score"], 3),
+                "doc_id": p.get("doc_id"),
+                "owner": p.get("owner"),
+                "origin_url": p.get("origin_url"), # Если есть ссылка на файл
+                "chunk_index": p.get("chunk_index"),
+                "offset": p.get("offset")
+            }
+            sources_metadata.append(meta)
+
+        # Объединяем все части через двойной перенос строки для читаемости
+        final_text = "\n\n".join(formatted_parts)
+        
+        return final_text, sources_metadata
 
     def _is_valid_embedding(self, emb) -> bool:
         """Проверка, что эмбеддинг не вырожденный (не нулевой вектор)"""
@@ -397,82 +413,129 @@ class QdrantService(BaseService):
         except Exception:
             return ""
 
-    def _chunk_text(self, text: str, chunk_size: int = 3000, overlap: int = 500) -> List[Tuple[str, int]]:
+    def _chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[Tuple[str, int]]:
         """
-        Разбивает текст на чанки по символам с перекрытием.
-        Возвращает список (chunk_text, start_offset)
+        Умная нарезка текста. 
+        Основной метод упрощен, логика поиска границы вынесена.
         """
         if not text:
             return []
-        length = len(text)
+
         chunks = []
         start = 0
+        length = len(text)
+
         while start < length:
-            end = start + chunk_size
-            chunk = text[start:end]
-            chunks.append((chunk, start))
+            # Определяем предварительный конец
+            target_end = min(start + chunk_size, length)
+            
+            # Ищем, где лучше всего обрезать, если мы не в конце текста
+            end = target_end
+            if end < length:
+                end = self._find_smart_split_point(text, start, target_end, chunk_size)
+
+            # Формируем чанк
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append((chunk, start))
+            
             if end >= length:
                 break
-            # сдвигаем на chunk_size - overlap
-            start = end - overlap
+                
+            # Сдвигаем start для следующего чанка
+            start = max(start + 1, end - overlap)
+
         return chunks
 
+    def _find_smart_split_point(self, text: str, start: int, end: int, chunk_size: int) -> int:
+        """
+        Вспомогательный метод: ищет лучший разделитель в конце отрезка.
+        Возвращает индекс конца чанка.
+        """
+        # Зона поиска: последние 20% чанка
+        search_start = max(start, end - int(chunk_size * 0.2))
+        
+        separators = ["\n\n", "\n", ". ", "! ", "? ", " "]
+        
+        for sep in separators:
+            sep_pos = text.rfind(sep, search_start, end)
+            if sep_pos != -1:
+                return sep_pos + len(sep)
+        
+        # Если разделитель не найден, возвращаем исходный конец (режем жестко)
+        return end
+
+    #
     async def _embed_texts(self, texts: List[str]) -> List[Any]:
         """
-        Надёжный батчевый эмбеддинг: проверяем вход, логируем проблему и используем именованные аргументы.
-        Возвращает список эмбеддингов (numpy arrays / list).
+        Главный метод эмбеддинга. Координирует процесс.
         """
-        # 1) Нормализуем вход: приводим всё к строкам (и логируем случаи приведения)
+        norm_texts = self._normalize_inputs(texts)
+        loop = asyncio.get_event_loop()
+        embeddings = []
+
+        for i in range(0, len(norm_texts), self.embedding_batch):
+            batch = norm_texts[i : i + self.embedding_batch]
+            batch_embeddings = await self._process_embedding_batch(loop, batch, i)
+            embeddings.extend(batch_embeddings)
+            
+        return embeddings
+
+    def _normalize_inputs(self, texts: List[Any]) -> List[str]:
+        """Приводит входные данные к строкам."""
         norm_texts = []
         for i, t in enumerate(texts):
             if isinstance(t, str):
                 norm_texts.append(t)
             else:
                 try:
-                    s = str(t)
-                    print("qdrant: embed_texts coerced input[%d] of type %s to str", i, type(t).__name__)
-                    norm_texts.append(s)
+                    # Лучше использовать logger вместо print
+                    print(f"qdrant: coercing input[{i}] type {type(t).__name__} to str")
+                    norm_texts.append(str(t))
                 except Exception as e:
-                    print("qdrant: cannot coerce input[%d] to str: %s", i, e)
-                    raise RuntimeError(f"Invalid input type for embedding at index {i}: {type(t)}") from e
+                    raise RuntimeError(f"Invalid input for embedding at index {i}: {e}")
+        return norm_texts
 
-        loop = asyncio.get_event_loop()
-        embeddings = []
+    async def _process_embedding_batch(self, loop, batch: List[str], start_idx: int) -> List[Any]:
+        """
+        Пытается обработать батч целиком. При ошибке переходит к поштучной обработке.
+        """
+        # Частичная функция для запуска в executor
+        func = functools.partial(
+            self.embed_model.encode, 
+            batch, 
+            convert_to_numpy=True, 
+            show_progress_bar=False
+        )
 
-        for i in range(0, len(norm_texts), self.embedding_batch):
-            batch = norm_texts[i:i + self.embedding_batch]
-            # Логируем кратко содержимое батча (первые 3 элементов) для отладки
-            print("qdrant: embedding batch start_idx=%d size=%d sample_types=%s", i, len(batch),
-                        [type(x).__name__ for x in batch[:3]])
+        try:
+            return await loop.run_in_executor(None, func)
+        except Exception as e:
+            print(f"Batch embedding failed at idx {start_idx}: {e}. Switching to fallback.")
+            return await self._process_batch_fallback(loop, batch, start_idx)
 
-            # Вызываем encode в executor с именованными аргументами
-            func = functools.partial(self.embed_model.encode,
-                                    batch,
-                                    convert_to_numpy=True,
-                                    show_progress_bar=False)
+    async def _process_batch_fallback(self, loop, batch: List[str], start_idx: int) -> List[Any]:
+        """
+        Медленный режим: обрабатывает элементы по одному, чтобы найти битый элемент.
+        """
+        results = []
+        for j, item in enumerate(batch):
+            func_single = functools.partial(
+                self.embed_model.encode, 
+                [item], # encode ожидает список или строку, но для consistency передаем список
+                convert_to_numpy=True, 
+                show_progress_bar=False
+            )
             try:
-                emb = await loop.run_in_executor(None, func)
-                embeddings.extend(emb)
-            except Exception as exc:
-                # Подробный лог перед попыткой поэлементного fallback
-                print("qdrant: embedding failed on batch starting at %d: %s", i, exc)
-                print("qdrant: problematic batch preview: %s", [repr(x)[:300] for x in batch[:10]])
-
-                # fallback: попробовать эмбеддить элементы по одному, чтобы найти проблемный
-                for j, single in enumerate(batch):
-                    try:
-                        func_single = functools.partial(self.embed_model.encode,
-                                                        [single],
-                                                        convert_to_numpy=True,
-                                                        show_progress_bar=False)
-                        single_emb = await loop.run_in_executor(None, func_single)
-                        embeddings.extend(single_emb)
-                    except Exception as e2:
-                        print("qdrant: single encode failed at global_index=%d: %s", i + j, e2)
-                        # Поднимаем понятную ошибку с индексом проблемного элемента
-                        raise RuntimeError(f"Embedding failed for item index {i + j}: type={type(single).__name__}, repr={repr(single)[:500]}") from e2
-        return embeddings
-
+                # Результат encode для списка — это список векторов. Берем [0] или extend
+                emb = await loop.run_in_executor(None, func_single)
+                results.extend(emb)
+            except Exception as e:
+                global_idx = start_idx + j
+                print(f"Single encode failed at index {global_idx}")
+                raise RuntimeError(f"Embedding failed for item {global_idx} (len={len(item)})") from e
+        return results
+    
     async def _qdrant_upsert(self, points: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Upsert points в Qdrant (использует sync client в executor).
@@ -487,8 +550,6 @@ class QdrantService(BaseService):
             self.qdrant.upsert(collection_name=QDRANT_COLLECTION, points=q_points)
             return {"upserted": len(q_points)}
         return await loop.run_in_executor(None, _sync_upsert)
-
-
 
 
 

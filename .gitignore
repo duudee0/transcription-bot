@@ -30,3 +30,4 @@ hf_cache/
 models/
 qdrant_storage/
 telegram-bot/logs
+services/qdrant-service/model_cache/
