@@ -6,6 +6,7 @@ aiofiles
 aio_pika
 
 # Для Silero
+silero-tts
 torch
 numpy 
 omegaconf 

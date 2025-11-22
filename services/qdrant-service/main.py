@@ -626,7 +626,7 @@ class QdrantService(BaseService):
                 using=None,   # ✅ None для default вектора (или имя если несколько векторов)
                 limit=top,
                 with_payload=True,
-                score_threshold=0.3,  # ✅ ФИЛЬТРАЦИЯ ПО РЕЛЕВАНТНОСТИ
+                score_threshold=score_threshold,  # ✅ ФИЛЬТРАЦИЯ ПО РЕЛЕВАНТНОСТИ
                 with_vectors=False
             )
             
