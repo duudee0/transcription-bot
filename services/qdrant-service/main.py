@@ -37,7 +37,7 @@ except Exception:
 # Конфиг по окружению
 # -------------------------
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-QDRANT_HOST = os.getenv("QDRANT_HOST", "127.0.0.1")
+QDRANT_HOST = os.getenv("QDRANT_HOST", "qdrant")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "documents")
@@ -254,7 +254,7 @@ class QdrantService(BaseService):
     async def _handle_search(self, task_message: TaskMessage) -> Data:
         payload = task_message.data.payload
         query = payload.get("text", "").strip()
-        top_k = int(payload.get("top_k", 6))
+        top_k = int(payload.get("top_k", 3))
 
         # 1. Валидация запроса
         if not query:
@@ -278,7 +278,7 @@ class QdrantService(BaseService):
         )
 
         # 4. Формирование ответа (текст + метаданные)
-        formatted_text, sources_meta = self._format_results(search_results)
+        formatted_text, sources_meta = self._format_results(search_results, query)
         
         # Логика ответа: даже если ничего не найдено, возвращаем Data, но с пустым текстом
         # или сообщением, чтобы пайплайн не падал с ошибкой, а LLM знала, что контекста нет.
@@ -289,7 +289,7 @@ class QdrantService(BaseService):
             "found_count": len(search_results)
         }
 
-        # Метаданные отправляем в execution_metadata, как ты просил
+        # Метаданные отправляем в execution_metadata
         exec_meta = {
             "service": self.service_name,
             "model": EMBEDDING_MODEL_NAME,
@@ -303,43 +303,71 @@ class QdrantService(BaseService):
             execution_metadata=exec_meta
         )
 
-    def _format_results(self, results: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
+    def _format_results(self, results: List[Dict[str, Any]], query: str) -> Tuple[str, List[Dict[str, Any]]]:
         """
-        Превращает сырой ответ Qdrant в красивую строку для LLM и список метаданных.
+        Форматирует результаты для LLM: структурированный текст с метаданными источников
         """
         if not results:
-            return "", []
+            return (
+                f"No relevant documents found for query: '{query}'. "
+                "Possible reasons: documents not indexed, query too specific, or low relevance threshold.",
+                []
+            )
 
-        formatted_parts = []
+        # Формируем контекстный текст для LLM
+        context_parts = []
         sources_metadata = []
 
+        # Сначала собираем все источники для ссылок
+        sources_index = {}
         for i, hit in enumerate(results):
-            # Извлекаем данные из payload точки Qdrant
-            # hit имеет структуру: {'id': ..., 'score': ..., 'payload': {...}}
-            p = hit.get("payload", {})
-            text_content = p.get("text_preview", "").strip()
+            payload = hit["payload"]
+            source_key = f"{payload.get('doc_id')}_{payload.get('chunk_index')}"
             
-            # Формируем блок текста для LLM
-            # Пример: 
-            # [1] (Score: 0.85) ...текст...
-            part = f"[{i + 1}] (Relevance: {hit['score']:.2f})\n{text_content}"
-            formatted_parts.append(part)
+            if source_key not in sources_index:
+                sources_index[source_key] = {
+                    "id": len(sources_index) + 1,
+                    "url": payload.get("origin_url"),
+                    "doc_id": payload.get("doc_id"),
+                    "owner": payload.get("owner")
+                }
+            
+            sources_metadata.append({
+                "source_id": sources_index[source_key]["id"],
+                "score": round(hit["score"], 4),
+                "text_preview": payload.get("text_preview", "")[:200],
+                "chunk_index": payload.get("chunk_index")
+            })
 
-            # Собираем технические данные (источники)
-            meta = {
-                "index": i + 1,
-                "score": round(hit["score"], 3),
-                "doc_id": p.get("doc_id"),
-                "owner": p.get("owner"),
-                "origin_url": p.get("origin_url"), # Если есть ссылка на файл
-                "chunk_index": p.get("chunk_index"),
-                "offset": p.get("offset")
-            }
-            sources_metadata.append(meta)
-
-        # Объединяем все части через двойной перенос строки для читаемости
-        final_text = "\n\n".join(formatted_parts)
+        # Формируем основной контекст
+        context_parts.append(f"Found {len(results)} relevant fragments for query: '{query}'")
+        context_parts.append("\nSources:")
         
+        # Добавляем список источников
+        for source in sources_index.values():
+            source_ref = f"[{source['id']}]"
+            if source["url"]:
+                source_ref += f" URL: {source['url']}"
+            else:
+                source_ref += f" Document ID: {source['doc_id']}"
+            source_ref += f" (Owner: {source['owner']})"
+            context_parts.append(source_ref)
+        
+        context_parts.append("\nRelevant content fragments:")
+        
+        # Добавляем фрагменты с ссылками на источники
+        for i, hit in enumerate(results):
+            payload = hit["payload"]
+            source_key = f"{payload.get('doc_id')}_{payload.get('chunk_index')}"
+            source_id = sources_index[source_key]["id"]
+            
+            fragment = (
+                f"Fragment #{i+1} (Relevance: {hit['score']:.3f}, Source: [{source_id}]):\n"
+                f"{payload.get('text_preview', '').strip()}"
+            )
+            context_parts.append(fragment)
+
+        final_text = "\n".join(context_parts)
         return final_text, sources_metadata
 
     def _is_valid_embedding(self, emb) -> bool:
@@ -350,7 +378,7 @@ class QdrantService(BaseService):
         return np.linalg.norm(emb) > 0.1  # Минимальная длина вектора
 
     # -------------------------
-    # Утилиты: скачивание, извлечение, чарнки, эмбеддинги, qdrant ops
+    # Утилиты
     # -------------------------
     async def _download_file(self, url: str) -> str:
         """Скачивает файл в temp и возвращает путь"""
@@ -378,6 +406,7 @@ class QdrantService(BaseService):
             raise HTTPException(status_code=400, detail=f"Failed to download: {str(e)}")
         return tmp_path
 
+    #TODO: Добавить разные форматы файлов
     async def _extract_text_from_file(self, file_path: str) -> str:
         """Попытка извлечь текст из файла: pdf -> text, txt -> decode"""
         # Если PDF и установлен fitz (PyMuPDF)
@@ -416,7 +445,6 @@ class QdrantService(BaseService):
     def _chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[Tuple[str, int]]:
         """
         Умная нарезка текста. 
-        Основной метод упрощен, логика поиска границы вынесена.
         """
         if not text:
             return []
@@ -536,21 +564,131 @@ class QdrantService(BaseService):
                 raise RuntimeError(f"Embedding failed for item {global_idx} (len={len(item)})") from e
         return results
     
-    async def _qdrant_upsert(self, points: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Upsert points в Qdrant (использует sync client в executor).
-        points: [{"id":..., "vector":[...], "payload": {...}}, ...]
-        """
-        loop = asyncio.get_event_loop()
-        def _sync_upsert():
-            # prepare qdrant points
+    def _sync_upsert_safe(self, points_batch: List[Dict]) -> int:
+        """Синхронный upsert с обработкой исключений"""
+        try:
+            # Подготовка точек в формате Qdrant 1.16.0
             q_points = []
-            for p in points:
-                q_points.append(qmodels.PointStruct(id=p["id"], vector=p["vector"], payload=p["payload"]))
-            self.qdrant.upsert(collection_name=QDRANT_COLLECTION, points=q_points)
-            return {"upserted": len(q_points)}
-        return await loop.run_in_executor(None, _sync_upsert)
+            for p in points_batch:
+                # Преобразование вектора
+                vector = p["vector"]
+                if hasattr(vector, "tolist"):
+                    vector = vector.tolist()
+                elif not isinstance(vector, list):
+                    vector = [float(x) for x in vector]
+                
+                # Создание точки в правильном формате
+                q_points.append(qmodels.PointStruct(
+                    id=str(p["id"]),  # Убедимся, что ID строковый
+                    vector=vector,
+                    payload=p.get("payload", {})
+                ))
+            
+            print(f"📤 Upserting {len(q_points)} points to collection '{QDRANT_COLLECTION}'")
+            
+            # Выполнение upsert для Qdrant 1.16.0
+            self.qdrant.upsert(
+                collection_name=QDRANT_COLLECTION,
+                points=q_points,
+                wait=True
+            )
+            
+            print(f"✅ Upsert successful: {len(q_points)} points")
+            return len(q_points)
+                
+        except Exception as e:
+            print(f"❌ Upsert failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            
+            # Детальная отладка ошибки
+            if "wrong input data" in str(e).lower() or "vectors" in str(e).lower():
+                print("🔍 Vector validation details:")
+                for i, p in enumerate(points_batch[:3]):
+                    vec = p["vector"]
+                    print(f"  Point #{i}:")
+                    print(f"    ID: {p.get('id')}")
+                    print(f"    Vector type: {type(vec)}")
+                    print(f"    Vector length: {len(vec) if hasattr(vec, '__len__') else 'unknown'}")
+                    if hasattr(vec, "shape"):
+                        print(f"    Vector shape: {vec.shape}")
+            
+            raise
 
+    async def _upsert_points_one_by_one(self, loop, points: List[Dict]) -> int:
+        """Резервный метод: upsert по одной точке"""
+        success_count = 0
+        for point in points:
+            try:
+                result = await loop.run_in_executor(
+                    None,
+                    functools.partial(self._sync_upsert_safe, [point])
+                )
+                success_count += result
+            except Exception as e:
+                print(f"❌ Single point upsert failed for {point.get('id')}: {e}")
+        return success_count
+ 
+    async def _qdrant_upsert(self, points: List[Dict[str, Any]], batch_size: int = 100) -> Dict[str, Any]:
+        """Upsert с полной валидацией и восстановлением при ошибках"""
+        
+        # Валидация точек данных
+        validated_points = []
+        for i, point in enumerate(points):
+            try:
+                # Проверяем обязательные поля
+                if not point.get("id"):
+                    point["id"] = str(uuid.uuid4())
+                    
+                if not point.get("vector"):
+                    print(f"⚠️ Skipping point without vector: {point.get('id')}")
+                    continue
+                    
+                if not isinstance(point["vector"], list) or len(point["vector"]) == 0:
+                    print(f"⚠️ Skipping point with invalid vector: {point.get('id')}")
+                    continue
+                    
+                # Проверяем размер вектора
+                expected_size = self.embed_model.get_sentence_embedding_dimension()
+                if len(point["vector"]) != expected_size:
+                    print(f"⚠️ Vector size mismatch for point {point.get('id')}: {len(point['vector'])} != {expected_size}")
+                    continue
+                    
+                validated_points.append(point)
+                
+            except Exception as e:
+                print(f"❌ Point validation failed at index {i}: {e}")
+                continue
+
+        if not validated_points:
+            return {"upserted": 0, "error": "No valid points to upsert"}
+
+        print(f"✅ Validated {len(validated_points)}/{len(points)} points for upsert")
+
+        loop = asyncio.get_event_loop()
+        success_count = 0
+
+        for i in range(0, len(validated_points), batch_size):
+            batch = validated_points[i:i + batch_size]
+            try:
+                # Используем меньший батч для надежности
+                result = await loop.run_in_executor(
+                    None, 
+                    functools.partial(self._sync_upsert_safe, batch)
+                )
+                success_count += result
+                print(f"✅ Successfully upserted batch {i//batch_size + 1}: {result} points")
+                
+                # Небольшая пауза между батчами
+                await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                print(f"❌ Batch upsert failed at index {i}: {e}")
+                # Пробуем upsert по одному
+                single_success = await self._upsert_points_one_by_one(loop, batch)
+                success_count += single_success
+
+        return {"upserted": success_count}
 
 
     #! ТЕСТОВЫЙ МЕТОД ДЛЯ ПРОВЕРКИ ВСЕХ ДОКУМЕНТОВ ИЗ КДРАНТ
@@ -562,12 +700,9 @@ class QdrantService(BaseService):
             all_points = []
             next_page = None
             while len(all_points) < limit * 10:  # Берем с запасом
-                points, next_page = self.qdrant.scroll(
-                    collection_name=QDRANT_COLLECTION,
-                    limit=100,
-                    offset=next_page,
-                    with_payload=["doc_id", "text_preview", "offset"]
-                )
+                scroll_result = self.qdrant.scroll(...)
+                points = scroll_result.points
+                next_page = scroll_result.next_page_offset
                 all_points.extend(points)
                 if next_page is None:
                     break
@@ -617,13 +752,13 @@ class QdrantService(BaseService):
 
         def _sync_query():
             # Конвертируем вектор в правильный формат
-            q_vec = [float(x) for x in vector.tolist()] if hasattr(vector, "tolist") else [float(x) for x in vector]
+            q_vec = vector.tolist() if hasattr(vector, "tolist") else [float(x) for x in vector]
             
             # === ПРАВИЛЬНЫЙ ВЫЗОВ ДЛЯ СОВРЕМЕННОГО QDRANT ===
             resp = self.qdrant.query_points(
                 collection_name=QDRANT_COLLECTION,
-                query=q_vec,  # ✅ ПРАВИЛЬНО ДЛЯ query_points()
-                using=None,   # ✅ None для default вектора (или имя если несколько векторов)
+                query=q_vec,  
+                using=None,   
                 limit=top,
                 with_payload=True,
                 score_threshold=score_threshold,  # ✅ ФИЛЬТРАЦИЯ ПО РЕЛЕВАНТНОСТИ
@@ -632,18 +767,18 @@ class QdrantService(BaseService):
             
             # === ПРАВИЛЬНАЯ ОБРАБОТКА РЕЗУЛЬТАТОВ ===
             hits = []
-            for pt in resp.points:  # ✅ resp.points вместо resp.result
-                # Отладка: показываем preview для каждого результата
-                preview = pt.payload.get('text_preview', '')
-                print(f"🔍 Hit (score={pt.score}): {preview}...")
-                
+            for point in resp.points:
                 hits.append({
-                    "id": pt.id,
-                    "score": pt.score,  # Для косинуса: 0.0-1.0
-                    "payload": pt.payload,
+                    "id": str(point.id),
+                    "score": float(point.score),
+                    "payload": point.payload or {},
                 })
+                # Отладка для каждого результата
+                preview = point.payload.get('text_preview', '')[:100] if point.payload else ''
+                print(f"  📌 Hit (score={point.score:.4f}): {preview}...")
             
-            print(f"✅ Found {len(hits)} relevant results (score_threshold=0.3)")
+            print(f"✅ Found {len(hits)} relevant results (score_threshold={score_threshold})")
+
             # 🔥 НОВЫЙ РЕЖИМ: ПРОВЕРКА ВСЕХ ДОКУМЕНТОВ
             print("\n" + "="*60)
             print("🐞 DEBUG ALL DOCUMENTS (first 5)")
@@ -664,17 +799,39 @@ class QdrantService(BaseService):
         return await loop.run_in_executor(None, _sync_query)
     
     def _ensure_collection_sync(self):
-        """Синхронно создаёт коллекцию если не существует (используется в init)"""
-        # Проверка наличия коллекции
-        collections = self.qdrant.get_collections().collections
-        names = [c.name for c in collections]
-        if QDRANT_COLLECTION not in names:
-            # создаём collection с размером вектора из модели
+        """Создание коллекции"""
+        try:
+            try:
+                self.qdrant.get_collection(collection_name=QDRANT_COLLECTION)
+                print(f"✅ Collection '{QDRANT_COLLECTION}' already exists")
+                return
+            except Exception as e:
+                # Пропускаем, если ошибка "not found", иначе рейзим
+                if "not found" not in str(e).lower() and "404" not in str(e):
+                    print(f"⚠️ Collection check warning: {str(e)}")
+
             vector_size = self.embed_model.get_sentence_embedding_dimension()
+            print(f"🔄 Creating collection '{QDRANT_COLLECTION}' with vector size {vector_size}")
+
+            # ИСПРАВЛЕННАЯ КОНФИГУРАЦИЯ
             self.qdrant.create_collection(
                 collection_name=QDRANT_COLLECTION,
-                vectors_config=qmodels.VectorParams(size=vector_size, distance=qmodels.Distance.COSINE)
+                vectors_config=qmodels.VectorParams(
+                    size=vector_size, 
+                    distance=qmodels.Distance.COSINE
+                ),
+                # Убираем default_segment_number=1.
+                # Оставляем пустым или дефолтным. Это снизит риск коррупции при сбоях.
+                hnsw_config=qmodels.HnswConfigDiff(
+                    m=16,
+                    ef_construct=100,
+                )
             )
+            print("✅ Collection created successfully")
+            
+        except Exception as e:
+            print(f"❌ Collection setup failed: {e}")
+            raise
 
     def close(self):
         loop = asyncio.get_event_loop()
