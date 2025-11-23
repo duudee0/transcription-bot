@@ -98,9 +98,19 @@ class QdrantService(BaseService):
         self.chunk_overlap = CHUNK_OVERLAP_CHARS
         self.embedding_batch = EMBEDDING_BATCH_SIZE
 
-        #! ТЕСТ ЭМБЕДИНГА
-        # print("\n💾 TESTING EMBEDING MODEL ")
-        # print(self.embed_model.encode(["hi","i"]))
+        # Константы поддерживаемых файлов для скачивания
+        self.ALLOWED_EXTENSIONS = {".pdf", ".txt",} #".md", ".docx", ".rtf", ".html", ".htm"}
+        self.MIME_TO_EXTENSION = {
+            "application/pdf": ".pdf",
+            "text/plain": ".txt",
+            "text/markdown": ".md",
+            "application/msword": ".doc",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+            "text/rtf": ".rtf",
+            "text/html": ".html",
+            "application/octet-stream": ".bin"
+        }
+
 
     def _can_handle_task_type(self, task_type: str) -> bool:
         supported = [
@@ -381,119 +391,238 @@ class QdrantService(BaseService):
     # Утилиты
     # -------------------------
     async def _download_file(self, url: str) -> str:
-        """Скачивает файл в temp и возвращает путь"""
-        # Простая защита: запрещаем локальные адреса (SSRF)
+        """
+        Скачивает файл во временное хранилище.
+        Основной оркестратор процесса загрузки.
+        """
+        self._validate_url_security(url)
+        original_filename = self._extract_filename_from_url(url)
+        
+        try:
+            tmp_path = await self._stream_file_to_temp(url, original_filename)
+            self._validate_downloaded_file(tmp_path)
+            return tmp_path
+        except Exception as e:
+            # Гарантированная очистка при любой ошибке
+            if 'tmp_path' in locals() and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+
+    def _validate_url_security(self, url: str):
+        """Проверяет URL на попытки SSRF атак"""
         parsed = httpx.URL(url)
-        if parsed.host in ("127.0.0.1", "localhost"):
-            raise HTTPException(status_code=400, detail="Localhost downloads are forbidden")
+        blocked_hosts = {"127.0.0.1", "localhost", "0.0.0.0"}
+        blocked_suffixes = {".local", ".internal", ".localhost"}
+        
+        host = parsed.host.lower()
+        if host in blocked_hosts or any(host.endswith(suffix) for suffix in blocked_suffixes):
+            raise HTTPException(status_code=400, detail="Local network downloads are forbidden")
 
-        tmp_dir = tempfile.gettempdir()
-        tmp_name = f"qdrant_{uuid.uuid4().hex}.pdf"
-        tmp_path = os.path.join(tmp_dir, tmp_name)
+    def _extract_filename_from_url(self, url: str) -> str:
+        """Извлекает имя файла из URL"""
+        path = httpx.URL(url).path
+        return os.path.basename(path) or "downloaded_file"
 
+    async def _stream_file_to_temp(self, url: str, original_filename: str) -> str:
+        """
+        Скачивает файл и сохраняет во временное хранилище.
+        Возвращает путь к временному файлу.
+        """
+        async with self.client.stream("GET", url, timeout=DOWNLOAD_TIMEOUT) as response:
+            response.raise_for_status()
+            
+            file_ext = self._determine_file_extension(
+                original_filename,
+                response.headers.get("content-type", ""),
+                response.headers.get("content-disposition", "")
+            )
+            
+            tmp_path = self._create_temp_file_path(file_ext)
+            total_size = await self._write_response_to_file(response, tmp_path)
+            
+            self._log_download_details(original_filename, file_ext, total_size)
+            return tmp_path
+
+    def _determine_file_extension(self, filename: str, content_type: str, content_disposition: str) -> str:
+        """
+        Определяет расширение файла по нескольким источникам в порядке приоритета:
+        1. Content-Disposition header
+        2. Content-Type header
+        3. Имя файла из URL
+        """
+        # Приоритет 1: Content-Disposition
+        if "filename=" in content_disposition:
+            disp_filename = self._parse_content_disposition_filename(content_disposition)
+            if disp_filename:
+                ext = os.path.splitext(disp_filename)[1].lower()
+                if ext in self.ALLOWED_EXTENSIONS:
+                    return ext
+        
+        # Приоритет 2: Content-Type
+        mime_type = content_type.split(";")[0].strip().lower()
+        if mime_type in self.MIME_TO_EXTENSION:
+            ext = self.MIME_TO_EXTENSION[mime_type]
+            if ext in self.ALLOWED_EXTENSIONS:
+                return ext
+        
+        # Приоритет 3: Имя файла из URL
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in self.ALLOWED_EXTENSIONS:
+            return ext
+        
+        return ".bin"  # Безопасный fallback
+
+    def _parse_content_disposition_filename(self, header: str) -> str:
+        """Парсит имя файла из заголовка Content-Disposition"""
         try:
-            async with self.client.stream("GET", url, timeout=DOWNLOAD_TIMEOUT) as response:
-                response.raise_for_status()
-                total = 0
-                async with aiofiles.open(tmp_path, "wb") as f:
-                    async for chunk in response.aiter_bytes():
-                        total += len(chunk)
-                        if total > MAX_DOWNLOAD_SIZE:
-                            await f.close()
-                            raise HTTPException(status_code=400, detail="File too large")
-                        await f.write(chunk)
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=400, detail=f"Failed to download: {str(e)}")
-        return tmp_path
-
-    #TODO: Добавить разные форматы файлов
-    async def _extract_text_from_file(self, file_path: str) -> str:
-        """Попытка извлечь текст из файла: pdf -> text, txt -> decode"""
-        # Если PDF и установлен fitz (PyMuPDF)
-        ext = Path(file_path).suffix.lower()
-        if ext in (".pdf",) and fitz is not None:
-            # blocking -> run in executor
-            loop = asyncio.get_event_loop()
-            text = await loop.run_in_executor(None, self._sync_extract_pdf_text, file_path)
-            return text
-        else:
-            # пробуем прочитать как текст
-            # try:
-            #     async with aiofiles.open(file_path, "rb") as f:
-            #         data = await f.read()
-            #         try:
-            #             return data.decode("utf-8")
-            #         except Exception:
-            #             try:
-            #                 return data.decode("latin-1")
-            #             except Exception:
-            #                 return ""
-            # except Exception:
-            return ""
-
-    def _sync_extract_pdf_text(self, file_path: str) -> str:
-        """Синхронная извлечь текст из pdf через PyMuPDF"""
-        try:
-            doc = fitz.open(file_path)
-            parts = []
-            for page in doc:
-                parts.append(page.get_text("text"))
-            return "\n".join(parts)
+            # Извлекаем часть после 'filename='
+            filename_part = header.split("filename=")[-1].strip()
+            # Удаляем обрамляющие кавычки и пробелы
+            return filename_part.strip('"\' ')
         except Exception:
             return ""
 
+    def _create_temp_file_path(self, extension: str) -> str:
+        """Создает уникальный путь для временного файла"""
+        tmp_dir = tempfile.gettempdir()
+        unique_name = f"qdrant_{uuid.uuid4().hex}{extension}"
+        return os.path.join(tmp_dir, unique_name)
+
+    async def _write_response_to_file(self, response: httpx.Response, file_path: str) -> int:
+        """Записывает содержимое ответа в файл с контролем размера"""
+        total_size = 0
+        async with aiofiles.open(file_path, "wb") as f:
+            async for chunk in response.aiter_bytes():
+                total_size += len(chunk)
+                if total_size > MAX_DOWNLOAD_SIZE:
+                    await f.close()
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File exceeds maximum size of {MAX_DOWNLOAD_SIZE // (1024*1024)} MB"
+                    )
+                await f.write(chunk)
+        return total_size
+
+    def _validate_downloaded_file(self, file_path: str):
+        """Проверяет валидность скачанного файла"""
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=500, detail="File creation failed")
+        
+        file_size = os.path.getsize(file_path)
+        if file_size == 0:
+            os.unlink(file_path)
+            raise HTTPException(status_code=400, detail="Downloaded file is empty")
+        
+        if file_size > MAX_DOWNLOAD_SIZE:
+            os.unlink(file_path)
+            raise HTTPException(status_code=413, detail="File size exceeds limit after download")
+
+    def _log_download_details(self, original_name: str, ext: str, size: int):
+        """Логирует детали загрузки"""
+        print(f"📥 Downloaded: {original_name} -> {ext} ({size} bytes)")
+
+    async def _extract_text_from_file(self, file_path: str) -> str:
+        """
+        Извлекает текст из файла в зависимости от формата.
+        Поддерживаемые форматы: PDF, TXT
+        """
+        ext = Path(file_path).suffix.lower()
+        
+        if ext == ".pdf" and fitz is not None:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, self._sync_extract_pdf_text, file_path)
+        
+        elif ext in (".txt", ".text"):
+            try:
+                async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+                    return await f.read()
+            except UnicodeDecodeError:
+                # Попытка чтения с fallback-кодировкой
+                async with aiofiles.open(file_path, "r", encoding="latin-1") as f:
+                    return await f.read()
+        
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file format: {ext}. Supported formats: .pdf, .txt"
+        )
+
+    def _sync_extract_pdf_text(self, file_path: str) -> str:
+        """Извлекает текст из PDF файла с использованием PyMuPDF"""
+        try:
+            with fitz.open(file_path) as doc:
+                return "\n".join(page.get_text("text") for page in doc)
+        except Exception as e:
+            self.logger.error(f"PDF extraction failed for {file_path}: {str(e)}")
+            raise HTTPException(
+                status_code=422,
+                detail=f"Failed to extract text from PDF: {str(e)}"
+            )
+
     def _chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[Tuple[str, int]]:
         """
-        Умная нарезка текста. 
+        Разбивает текст на чанки с умным разделением по естественным границам.
+        
+        Args:
+            text: Исходный текст
+            chunk_size: Максимальный размер чанка в символах
+            overlap: Количество символов перекрытия между чанками
+        
+        Returns:
+            Список кортежей (текст_чанка, начальная_позиция_в_исходном_тексте)
         """
-        if not text:
+        if not text.strip():
             return []
-
+        
         chunks = []
         start = 0
-        length = len(text)
-
-        while start < length:
-            # Определяем предварительный конец
-            target_end = min(start + chunk_size, length)
+        text_length = len(text)
+        
+        while start < text_length:
+            # Определяем конец текущего чанка
+            end = min(start + chunk_size, text_length)
             
-            # Ищем, где лучше всего обрезать, если мы не в конце текста
-            end = target_end
-            if end < length:
-                end = self._find_smart_split_point(text, start, target_end, chunk_size)
-
-            # Формируем чанк
+            # Ищем лучшее место для разделения, если не в конце текста
+            if end < text_length:
+                end = self._find_smart_split_point(text, start, end)
+            
+            # Добавляем чанк, если он не пустой
             chunk = text[start:end].strip()
             if chunk:
                 chunks.append((chunk, start))
             
-            if end >= length:
+            # Проверка завершения
+            if end >= text_length:
                 break
-                
-            # Сдвигаем start для следующего чанка
-            start = max(start + 1, end - overlap)
-
+            
+            # Вычисляем начало следующего чанка с учетом перекрытия
+            next_start = end - overlap
+            # Защита от зацикливания и отрицательных значений
+            if next_start <= start:
+                next_start = end
+            start = next_start
+        
         return chunks
 
-    def _find_smart_split_point(self, text: str, start: int, end: int, chunk_size: int) -> int:
+    def _find_smart_split_point(self, text: str, start: int, end: int) -> int:
         """
-        Вспомогательный метод: ищет лучший разделитель в конце отрезка.
-        Возвращает индекс конца чанка.
+        Находит оптимальную точку разделения текста в диапазоне [start, end].
+        Приоритет разделителей: абзацы > предложения > пробелы.
         """
-        # Зона поиска: последние 20% чанка
-        search_start = max(start, end - int(chunk_size * 0.2))
+        # Зона поиска: последние 20% текущего чанка
+        search_zone_start = max(start, end - int((end - start) * 0.2))
         
-        separators = ["\n\n", "\n", ". ", "! ", "? ", " "]
+        # Приоритетные разделители от более значимых к менее
+        separators = ["\n\n", "\n", ". ", "! ", "? ", "; ", " "]
         
         for sep in separators:
-            sep_pos = text.rfind(sep, search_start, end)
-            if sep_pos != -1:
-                return sep_pos + len(sep)
+            # Ищем разделитель справа налево в зоне поиска
+            pos = text.rfind(sep, search_zone_start, end)
+            if pos != -1:
+                return pos + len(sep)  # Возвращаем позицию после разделителя
         
-        # Если разделитель не найден, возвращаем исходный конец (режем жестко)
-        return end
+        return end  # Если разделитель не найден, разделяем жестко
 
-    #
+
     async def _embed_texts(self, texts: List[str]) -> List[Any]:
         """
         Главный метод эмбеддинга. Координирует процесс.
@@ -567,53 +696,100 @@ class QdrantService(BaseService):
     def _sync_upsert_safe(self, points_batch: List[Dict]) -> int:
         """Синхронный upsert с обработкой исключений"""
         try:
-            # Подготовка точек в формате Qdrant 1.16.0
-            q_points = []
-            for p in points_batch:
-                # Преобразование вектора
-                vector = p["vector"]
-                if hasattr(vector, "tolist"):
-                    vector = vector.tolist()
-                elif not isinstance(vector, list):
-                    vector = [float(x) for x in vector]
-                
-                # Создание точки в правильном формате
-                q_points.append(qmodels.PointStruct(
-                    id=str(p["id"]),  # Убедимся, что ID строковый
-                    vector=vector,
-                    payload=p.get("payload", {})
-                ))
-            
-            print(f"📤 Upserting {len(q_points)} points to collection '{QDRANT_COLLECTION}'")
-            
-            # Выполнение upsert для Qdrant 1.16.0
-            self.qdrant.upsert(
-                collection_name=QDRANT_COLLECTION,
-                points=q_points,
-                wait=True
-            )
-            
-            print(f"✅ Upsert successful: {len(q_points)} points")
+            q_points = self._prepare_points_for_upsert(points_batch)
+            self._execute_upsert(q_points)
             return len(q_points)
-                
         except Exception as e:
-            print(f"❌ Upsert failed: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            
-            # Детальная отладка ошибки
-            if "wrong input data" in str(e).lower() or "vectors" in str(e).lower():
-                print("🔍 Vector validation details:")
-                for i, p in enumerate(points_batch[:3]):
-                    vec = p["vector"]
-                    print(f"  Point #{i}:")
-                    print(f"    ID: {p.get('id')}")
-                    print(f"    Vector type: {type(vec)}")
-                    print(f"    Vector length: {len(vec) if hasattr(vec, '__len__') else 'unknown'}")
-                    if hasattr(vec, "shape"):
-                        print(f"    Vector shape: {vec.shape}")
-            
+            self._handle_upsert_error(e, points_batch)
             raise
+
+    def _prepare_points_for_upsert(self, points_batch: List[Dict]) -> List:
+        """Подготавливает точки в формате Qdrant"""
+        q_points = []
+        for point in points_batch:
+            q_point = self._convert_single_point(point)
+            if q_point:
+                q_points.append(q_point)
+        return q_points
+
+    def _convert_single_point(self, point: Dict):
+        """Конвертирует одну точку в формат Qdrant"""
+        # Преобразование вектора
+        vector = point["vector"]
+        vector_list = self._convert_vector_to_list(vector)
+        if not vector_list:
+            return None
+
+        # Создание точки в правильном формате
+        return qmodels.PointStruct(
+            id=str(point["id"]),
+            vector=vector_list,
+            payload=point.get("payload", {})
+        )
+
+    def _convert_vector_to_list(self, vector: Any) -> Optional[List]:
+        """Конвертирует вектор в список"""
+        try:
+            if hasattr(vector, "tolist"):
+                return vector.tolist()
+            elif isinstance(vector, list):
+                return [float(x) for x in vector]
+            else:
+                return None
+        except (ValueError, TypeError):
+            return None
+
+    def _execute_upsert(self, q_points: List):
+        """Выполняет upsert в Qdrant"""
+        if not q_points:
+            print("⚠️ No valid points to upsert")
+            return
+
+        print(f"📤 Upserting {len(q_points)} points to collection '{QDRANT_COLLECTION}'")
+        
+        self.qdrant.upsert(
+            collection_name=QDRANT_COLLECTION,
+            points=q_points,
+            wait=True
+        )
+        
+        print(f"✅ Upsert successful: {len(q_points)} points")
+
+    def _handle_upsert_error(self, error: Exception, points_batch: List[Dict]):
+        """Обрабатывает ошибки при upsert"""
+        print(f"❌ Upsert failed: {str(error)}")
+        import traceback
+        traceback.print_exc()
+        
+        # Детальная отладка ошибки
+        if self._is_vector_error(error):
+            self._debug_vector_issues(points_batch)
+
+    def _is_vector_error(self, error: Exception) -> bool:
+        """Определяет, связана ли ошибка с векторами"""
+        error_msg = str(error).lower()
+        return "wrong input data" in error_msg or "vectors" in error_msg
+
+    def _debug_vector_issues(self, points_batch: List[Dict]):
+        """Отладочная информация по проблемам с векторами"""
+        print("🔍 Vector validation details:")
+        for i, point in enumerate(points_batch[:3]):  # Показываем только первые 3
+            self._print_point_debug_info(point, i)
+
+    def _print_point_debug_info(self, point: Dict, index: int):
+        """Выводит отладочную информацию по одной точке"""
+        vector = point.get("vector")
+        print(f"  Point #{index}:")
+        print(f"    ID: {point.get('id')}")
+        print(f"    Vector type: {type(vector)}")
+        
+        if hasattr(vector, "__len__"):
+            print(f"    Vector length: {len(vector)}")
+        else:
+            print("    Vector length: unknown")
+            
+        if hasattr(vector, "shape"):
+            print(f"    Vector shape: {vector.shape}")
 
     async def _upsert_points_one_by_one(self, loop, points: List[Dict]) -> int:
         """Резервный метод: upsert по одной точке"""
@@ -632,63 +808,74 @@ class QdrantService(BaseService):
     async def _qdrant_upsert(self, points: List[Dict[str, Any]], batch_size: int = 100) -> Dict[str, Any]:
         """Upsert с полной валидацией и восстановлением при ошибках"""
         
-        # Валидация точек данных
-        validated_points = []
-        for i, point in enumerate(points):
-            try:
-                # Проверяем обязательные поля
-                if not point.get("id"):
-                    point["id"] = str(uuid.uuid4())
-                    
-                if not point.get("vector"):
-                    print(f"⚠️ Skipping point without vector: {point.get('id')}")
-                    continue
-                    
-                if not isinstance(point["vector"], list) or len(point["vector"]) == 0:
-                    print(f"⚠️ Skipping point with invalid vector: {point.get('id')}")
-                    continue
-                    
-                # Проверяем размер вектора
-                expected_size = self.embed_model.get_sentence_embedding_dimension()
-                if len(point["vector"]) != expected_size:
-                    print(f"⚠️ Vector size mismatch for point {point.get('id')}: {len(point['vector'])} != {expected_size}")
-                    continue
-                    
-                validated_points.append(point)
-                
-            except Exception as e:
-                print(f"❌ Point validation failed at index {i}: {e}")
-                continue
-
+        validated_points = self._validate_points(points)
         if not validated_points:
             return {"upserted": 0, "error": "No valid points to upsert"}
 
-        print(f"✅ Validated {len(validated_points)}/{len(points)} points for upsert")
+        success_count = await self._process_batches(validated_points, batch_size)
+        return {"upserted": success_count}
 
+    def _validate_points(self, points: List[Dict]) -> List[Dict]:
+        """Валидация точек данных"""
+        validated_points = []
+        for point in points:
+            try:
+                validated_point = self._validate_single_point(point)
+                if validated_point:
+                    validated_points.append(validated_point)
+            except Exception as e:
+                print(f"❌ Point validation failed: {e}")
+                continue
+        return validated_points
+
+    def _validate_single_point(self, point: Dict) -> Optional[Dict]:
+        """Валидация одной точки"""
+        # Проверяем обязательные поля
+        if not point.get("id"):
+            point["id"] = str(uuid.uuid4())
+            
+        if not point.get("vector"):
+            print(f"⚠️ Skipping point without vector: {point.get('id')}")
+            return None
+            
+        if not isinstance(point["vector"], list) or len(point["vector"]) == 0:
+            print(f"⚠️ Skipping point with invalid vector: {point.get('id')}")
+            return None
+            
+        # Проверяем размер вектора
+        expected_size = self.embed_model.get_sentence_embedding_dimension()
+        if len(point["vector"]) != expected_size:
+            print(f"⚠️ Vector size mismatch for point {point.get('id')}: {len(point['vector'])} != {expected_size}")
+            return None
+            
+        return point
+
+    async def _process_batches(self, validated_points: List[Dict], batch_size: int) -> int:
+        """Обработка точек батчами"""
         loop = asyncio.get_event_loop()
         success_count = 0
 
         for i in range(0, len(validated_points), batch_size):
             batch = validated_points[i:i + batch_size]
-            try:
-                # Используем меньший батч для надежности
-                result = await loop.run_in_executor(
-                    None, 
-                    functools.partial(self._sync_upsert_safe, batch)
-                )
-                success_count += result
-                print(f"✅ Successfully upserted batch {i//batch_size + 1}: {result} points")
-                
-                # Небольшая пауза между батчами
-                await asyncio.sleep(0.1)
-                
-            except Exception as e:
-                print(f"❌ Batch upsert failed at index {i}: {e}")
-                # Пробуем upsert по одному
-                single_success = await self._upsert_points_one_by_one(loop, batch)
-                success_count += single_success
+            batch_success = await self._process_single_batch(loop, batch, i)
+            success_count += batch_success
+            
+        return success_count
 
-        return {"upserted": success_count}
+    async def _process_single_batch(self, loop, batch: List[Dict], batch_index: int) -> int:
+        """Обработка одного батча"""
+        try:
+            result = await loop.run_in_executor(
+                None, 
+                functools.partial(self._sync_upsert_safe, batch)
+            )
+            print(f"✅ Successfully upserted batch {batch_index//len(batch) + 1}: {result} points")
+            await asyncio.sleep(0.1)
+            return result
+        except Exception as e:
+            print(f"❌ Batch upsert failed at index {batch_index}: {e}")
+            # Fallback: upsert по одному
+            return await self._upsert_points_one_by_one(loop, batch)
 
 
     #! ТЕСТОВЫЙ МЕТОД ДЛЯ ПРОВЕРКИ ВСЕХ ДОКУМЕНТОВ ИЗ КДРАНТ
@@ -761,7 +948,7 @@ class QdrantService(BaseService):
                 using=None,   
                 limit=top,
                 with_payload=True,
-                score_threshold=score_threshold,  # ✅ ФИЛЬТРАЦИЯ ПО РЕЛЕВАНТНОСТИ
+                score_threshold=score_threshold,  # ФИЛЬТРАЦИЯ ПО РЕЛЕВАНТНОСТИ
                 with_vectors=False
             )
             
@@ -779,7 +966,7 @@ class QdrantService(BaseService):
             
             print(f"✅ Found {len(hits)} relevant results (score_threshold={score_threshold})")
 
-            # 🔥 НОВЫЙ РЕЖИМ: ПРОВЕРКА ВСЕХ ДОКУМЕНТОВ
+            #! ДЕБАГ МОМЕНТ СЛЕДУЕТ УБРАТЬ ЭТО
             print("\n" + "="*60)
             print("🐞 DEBUG ALL DOCUMENTS (first 5)")
             print("="*60)
