@@ -146,7 +146,7 @@ async def handle_task_selection(message: Message, state: FSMContext) -> None:
     else:
         # Используем сервис по умолчанию
         default_service = task_config["default_service"]
-        await state.update_data(selected_service=default_service)
+        await state.update_data(selected_service=[default_service])
         await state.set_state(TaskCreationState.waiting_for_input)
         
         input_type = task_config["input_type"]
@@ -186,7 +186,7 @@ async def handle_llm_selection(callback: CallbackQuery, state: FSMContext) -> No
                     await state.update_data(service_chain=service_chain)
             i+=1
 
-    await state.update_data(selected_service=service_id)
+    await state.update_data(selected_service=[service_id])
     await state.set_state(TaskCreationState.waiting_for_input)
     
     await callback.message.edit_text(
@@ -270,10 +270,13 @@ async def handle_text_input(message: Message, state: FSMContext) -> None:
     # Определяем цепочку сервисов
     if task_config.get("is_chain"):
         service_chain = config.SERVICE_CHAINS.get(task_type, [])
+        logger.info(f"1 {service_chain}")
     elif "service_chain" in user_data:
         service_chain = user_data["service_chain"]
+        logger.info(f"2 {service_chain}")
     else:
         service_chain = user_data["selected_service"]
+        logger.info(f"3 {service_chain}")
 
     # Создаем задачу
     try:
