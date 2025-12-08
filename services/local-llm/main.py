@@ -175,7 +175,7 @@ class LocalModelService(BaseService):
         prompt = task_message.data.payload.get("text", "")
         
         # Дополнительные параметры
-        max_tokens = task_message.data.payload.get("max_tokens", 512)
+        max_tokens = task_message.data.payload.get("max_tokens", 2048)
         temperature = task_message.data.payload.get("temperature", 0.7)
         
         # Вызываем локальную модель

@@ -166,6 +166,11 @@ services:
       - OLLAMA_HOST=http://host.docker.internal:11434 # Запущена локально вне docker
       #- LOCAL_MODEL=llama2:7b  # Модель по умолчанию
       - LOCAL_MODEL=deepseek-r1:8b
+    volumes:
+      - ./services/local-llm:/app
+      - ./common/models.py:/app/common/models.py:ro
+      - ./common/publisher.py:/app/common/publisher.py:ro
+      - ./services/common/base_service.py:/app/common/base_service.py:ro
     command: sh -c "sleep 7 && exec python main.py"
     depends_on:
       - ollama
