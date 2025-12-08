@@ -162,8 +162,10 @@ services:
     ports:
       - "8004:8000"
     environment:
-      - OLLAMA_HOST=http://ollama:11434
-      - LOCAL_MODEL=llama2:7b  # Модель по умолчанию
+      #- OLLAMA_HOST=http://ollama:11434 # Запущена в докере
+      - OLLAMA_HOST=http://host.docker.internal:11434 # Запущена локально вне docker
+      #- LOCAL_MODEL=llama2:7b  # Модель по умолчанию
+      - LOCAL_MODEL=deepseek-r1:8b
     command: sh -c "sleep 7 && exec python main.py"
     depends_on:
       - ollama

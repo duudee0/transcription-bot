@@ -30,38 +30,130 @@ class LocalModelService(BaseService):
         return task_type in supported_task_types
 
     def _health_handler(self):
-        """Проверка здоровья сервиса и доступности модели"""
+        """Проверка здоровья сервиса и доступности модели с подробным логированием"""
         try:
+            # Логируем попытку подключения
+            health_check_url = f"{self.ollama_host}/api/tags"
+            print(f"🔍 Проверка здоровья Ollama...")
+            print(f"   Хост: {self.ollama_host}")
+            print(f"   Модель: {self.model_name}")
+            print(f"   URL запроса: {health_check_url}")
+            
             # Проверяем доступность Ollama
-            response = requests.get(f"{self.ollama_host}/api/tags", timeout=5)
+            response = requests.get(health_check_url, timeout=5)
+            
+            # Детальная информация о HTTP-ответе
+            print(f"✅ HTTP запрос выполнен")
+            print(f"   Статус код: {response.status_code}")
+            print(f"   Время ответа: {response.elapsed.total_seconds():.2f} секунд")
+            
             models_available = response.status_code == 200
             
-            print(f' ❔ Access ollama: {models_available}')
-
-            # # Проверяем, загружена ли наша модель
-            # if models_available:
-            #     models_data = response.json()
-            #     model_loaded = any(self.model_name in model['name'] for model in models_data.get('models', []))
-            # else:
-            #     model_loaded = False
+            if models_available:
+                print(f"🎉 Ollama доступен и отвечает!")
+                
+                # Проверяем, загружена ли наша модель (раскомментируйте если нужно)
+                try:
+                    models_data = response.json()
+                    all_models = [model['name'] for model in models_data.get('models', [])]
+                    model_loaded = any(self.model_name in model_name for model_name in all_models)
+                    
+                    print(f"📋 Доступные модели в Ollama: {', '.join(all_models) if all_models else 'Нет моделей'}")
+                    print(f"🔎 Ищем модель '{self.model_name}': {'НАЙДЕНА' if model_loaded else 'НЕ НАЙДЕНА'}")
+                    
+                    if not model_loaded:
+                        print(f"⚠️  Внимание: Модель '{self.model_name}' не найдена в Ollama!")
+                        print(f"   Используйте команду: ollama pull {self.model_name}")
+                except Exception as parse_error:
+                    print(f"⚠️  Не удалось разобрать ответ от Ollama: {str(parse_error)}")
+                    print(f"   Ответ сервера: {response.text[:200]}...")
+                    model_loaded = False
+            else:
+                print(f"❌ Ollama недоступен! Статус код: {response.status_code}")
+                print(f"   Ответ сервера: {response.text[:200]}...")
+                model_loaded = False
             
-            # print(f' ❔ Is busy ollama: {models_available}')
-
-            status = "ok" if models_available else "unhealthy"
+            status = "ok" if (models_available and model_loaded) else "unhealthy"
             
-            return {
+            result = {
                 "status": status,
                 "service": self.service_name,
                 "model": self.model_name,
                 "ollama_available": models_available,
-                #"model_loaded": model_loaded,
-                "host": self.ollama_host
+                "model_loaded": model_loaded,
+                "host": self.ollama_host,
+                "http_status": response.status_code,
+                "response_time_seconds": response.elapsed.total_seconds(),
+                "available_models": all_models if models_available else []
             }
-        except Exception as e:
+            
+            print(f"📊 Итоговый статус: {status.upper()}")
+            print("-" * 50)
+            
+            return result
+            
+        except requests.exceptions.Timeout:
+            error_msg = f"Таймаут подключения к Ollama ({self.ollama_host}) через 5 секунд"
+            print(f"⏰ {error_msg}")
+            print(f"   Проверьте:")
+            print(f"   1. Запущен ли Ollama на хосте: ollama serve")
+            print(f"   2. Правильно ли настроен OLLAMA_HOST: сейчас '{self.ollama_host}'")
+            print(f"   3. Доступен ли порт 11434 из контейнера")
+            
             return {
                 "status": "error",
                 "service": self.service_name,
-                "error": str(e)
+                "error": error_msg,
+                "error_type": "Timeout",
+                "host": self.ollama_host,
+                "model": self.model_name
+            }
+            
+        except requests.exceptions.ConnectionError as e:
+            error_msg = f"Не удалось подключиться к Ollama ({self.ollama_host})"
+            print(f"🔌 {error_msg}")
+            print(f"   Детали: {str(e)}")
+            print(f"   Возможные причины:")
+            print(f"   1. Ollama не запущена. Запустите: ollama serve")
+            print(f"   2. Неправильный адрес. Проверьте OLLAMA_HOST: сейчас '{self.ollama_host}'")
+            print(f"   3. Огненная стена блокирует порт 11434")
+            
+            return {
+                "status": "error",
+                "service": self.service_name,
+                "error": error_msg,
+                "error_type": "ConnectionError",
+                "details": str(e),
+                "host": self.ollama_host,
+                "model": self.model_name
+            }
+            
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Ошибка при запросе к Ollama: {str(e)}"
+            print(f"🚨 {error_msg}")
+            
+            return {
+                "status": "error",
+                "service": self.service_name,
+                "error": error_msg,
+                "error_type": type(e).__name__,
+                "host": self.ollama_host,
+                "model": self.model_name
+            }
+            
+        except Exception as e:
+            error_msg = f"Неожиданная ошибка: {str(e)}"
+            print(f"💥 {error_msg}")
+            import traceback
+            traceback.print_exc()
+            
+            return {
+                "status": "error",
+                "service": self.service_name,
+                "error": error_msg,
+                "error_type": type(e).__name__,
+                "host": self.ollama_host,
+                "model": self.model_name
             }
 
     async def _validate_task(self, task_message: TaskMessage):
