@@ -47,7 +47,7 @@ services:
     # Переменные окружения
     environment:
       # Указываем сервису, что нужно использовать CPU
-      - SERVICE_BASE_URL=http://voiceover:8000
+      - SERVICE_BASE_URL=http://localhost:8007
       - USE_CUDA=False #  отключаем CUDA
       - XTTS_TIMEOUT=900 # Увеличим таймаут, так как CPU медленный
       
