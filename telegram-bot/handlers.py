@@ -329,7 +329,7 @@ async def handle_voice_input(message: Message, state: FSMContext) -> None:
     elif "service_chain" in user_data:
         service_chain = user_data["service_chain"]
     elif user_data:
-        service_chain = [user_data["selected_service"]]
+        service_chain = user_data["selected_service"]
     else:
         service = config.TASK_TYPES.get("voice_transcription").get("default_service")
         service_chain = [service]

@@ -27,7 +27,7 @@ class Config:
 
     # Available services for user selection
     LLM_SERVICES = {
-        "local-llm": "🚀 Локальная модель (llama2:7b)",
+        "local-llm": "🚀 Локальная модель (Ollama.cpp)",
         "gigachat-service": "🧠 GigaChat",
         "qwen": "🔮 Qwen (Open Router)",
         "yandex-gpt": "💤 Yandex GPT",

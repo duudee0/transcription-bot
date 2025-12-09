@@ -47,20 +47,24 @@ services:
     # Переменные окружения
     environment:
       # Указываем сервису, что нужно использовать CPU
-      - SERVICE_BASE_URL=http://localhost:8007
+      # - SERVICE_BASE_URL=http://localhost:8007 # Получить доступ из вне
+      - SERVICE_BASE_URL=http://voiceover:8000 # Внутри докер
       - USE_CUDA=False #  отключаем CUDA
       - XTTS_TIMEOUT=900 # Увеличим таймаут, так как CPU медленный
-      
+      - SILERO_CACHE_DIR=/app/silero_cache
+      - SILERO_PRELOAD=true
+      - SILERO_PRELOAD_LANGS=ru,en
       # Настройка кэша Hugging Face/TTS
       - HF_HOME=/app/cache/huggingface
       - TTS_HOME=/app/cache/tts
-      
+    command: sh -c "sleep 7 && exec python main.py"
     # Монтирование томов
     volumes:
       - ./audio_files:/app/audio_outputs
       - ./hf_cache:/app/cache/huggingface
       - ./tts_cache:/app/cache/tts
       - ./services/voiceover:/app
+      - ./services/voiceover/silero_cache:/app/silero_cache
       - ./common/models.py:/app/common/models.py:ro
       - ./common/publisher.py:/app/common/publisher.py:ro
       - ./services/common/base_service.py:/app/common/base_service.py:ro
@@ -197,6 +201,7 @@ services:
       - ./common/models.py:/app/common/models.py:ro
       - ./common/publisher.py:/app/common/publisher.py:ro
       - ./services/common/base_service.py:/app/common/base_service.py:ro
+    command: sh -c "sleep 7 && exec python main.py"
     deploy:
       resources:
         limits:
@@ -223,22 +228,6 @@ services:
     command: sh -c "sleep 7 && exec python main.py"
     networks:
       - internal
-
-  # manager:
-  #   build:
-  #     context: ./manager
-  #     dockerfile: Dockerfile
-  #   environment:
-  #     - RABBIT_URL=amqp://guest:guest@rabbitmq:5672/
-  #     - LLM_URL=http://llm-service:8000/api/v1/infer
-  #   depends_on:
-  #     - rabbitmq
-  #     - llm-service
-  #     - postgres
-  #     - redis
-  #   networks:
-  #     - frontend
-  #     - internal
 
   worker:
     build:

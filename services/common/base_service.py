@@ -179,7 +179,6 @@ class BaseService:
                 message_type=MessageType.RESULT,
                 source_service=self.service_name,
                 target_services=task_message.target_services,
-                original_message_id=task_message.message_id,
                 success=True,
                 data=Data(
                     task_type=task_message.data.task_type,
@@ -189,7 +188,8 @@ class BaseService:
                         "processing_mode": "async_webhook",
                         "service": self.service_name,
                         "remaining_chain": self._get_remaining_chain(task_message)
-                    }
+                    },
+                    original_message_id=task_message.message_id,
                 )
             )
         except HTTPException:
@@ -245,7 +245,6 @@ class BaseService:
                     message_type=MessageType.RESULT,
                     source_service=self.service_name,
                     target_services=[task_message.source_service],
-                    original_message_id=task_message.message_id,
                     success=False,
                     error_message=f"Failed to send task to next service: {next_service}",
                     data=result_data
@@ -257,7 +256,6 @@ class BaseService:
                 message_type=MessageType.RESULT,
                 source_service=self.service_name,
                 target_services=[task_message.source_service],
-                original_message_id=task_message.message_id,
                 success=True,
                 data=Data(
                     task_type=task_message.data.task_type if task_message.data else None,
@@ -272,7 +270,6 @@ class BaseService:
                 message_type=MessageType.RESULT,
                 source_service=self.service_name,
                 target_services=[],
-                original_message_id=task_message.message_id,
                 success=True if result_data.payload_type != PayloadType.ERROR else False,
                 data=result_data
             )
@@ -353,7 +350,6 @@ class BaseService:
                     message_type=MessageType.RESULT,
                     source_service=self.service_name,
                     target_services=[],  # цепочка завершена
-                    original_message_id=task_message.message_id,
                     success=True if result_data.payload_type != PayloadType.ERROR else False,
                 )
 
@@ -370,12 +366,12 @@ class BaseService:
                 message_type=MessageType.RESULT,
                 source_service=self.service_name,
                 target_services=task_message.target_services,
-                original_message_id=task_message.message_id,
                 success=False,
                 data=Data(
                     payload_type = PayloadType.ERROR,
                     payload={"text":str(type(e).__name__)},
-                    execution_metadata={"error": True, "service": self.service_name}
+                    execution_metadata={"error": True, "service": self.service_name},
+                    original_message_id=task_message.message_id,
                 )
             )
             # Ошибку отправим сервис не смог справиться
@@ -523,7 +519,3 @@ class BaseService:
         except Exception as e:
             print(f"❌ {self.service_name} webhook sending failed: {e}", file=sys.stderr)
             return False
-    
-    def run(self, host: str = "0.0.0.0", port: int = 8000):
-        """Запускает сервис"""
-        uvicorn.run(self.app, host=host, port=port)
